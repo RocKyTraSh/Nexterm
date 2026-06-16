@@ -155,6 +155,69 @@ enum Command {
         #[arg(long)]
         insecure: bool,
     },
+    /// List a remote directory over SFTP (needs `--features ssh-russh`).
+    ///
+    /// Dev harness: the password is read from `--password-env` (default
+    /// `NEXTERM_SSH_PASSWORD`) and never printed.
+    #[cfg(feature = "ssh-russh")]
+    SftpLs {
+        #[arg(long)]
+        host: String,
+        #[arg(long, default_value_t = 22)]
+        port: u16,
+        #[arg(long, default_value = "root")]
+        user: String,
+        /// Path to a private key file (publickey auth).
+        #[arg(long)]
+        key: Option<String>,
+        /// Env var holding the password (dev-only).
+        #[arg(long, default_value = "NEXTERM_SSH_PASSWORD")]
+        password_env: String,
+        /// Remote directory to list.
+        #[arg(long, default_value = "/")]
+        path: String,
+        /// Disable known_hosts checking (accept unknown host keys).
+        #[arg(long)]
+        insecure: bool,
+    },
+    /// List a remote directory over SFTP *through* a jump host
+    /// (needs `--features ssh-russh`).
+    ///
+    /// Opens SFTP on the target via a `direct-tcpip` channel on the gateway.
+    /// Passwords come from env vars (dev-only) and are never printed.
+    #[cfg(feature = "ssh-russh")]
+    SftpJumpLs {
+        #[arg(long)]
+        jump_host: String,
+        #[arg(long, default_value_t = 22)]
+        jump_port: u16,
+        #[arg(long)]
+        jump_user: String,
+        /// Private key for the jump host (publickey auth).
+        #[arg(long)]
+        jump_key: Option<String>,
+        /// Env var holding the jump host password (dev-only).
+        #[arg(long, default_value = "NEXTERM_JUMP_PASSWORD")]
+        jump_password_env: String,
+        #[arg(long)]
+        target_host: String,
+        #[arg(long, default_value_t = 22)]
+        target_port: u16,
+        #[arg(long)]
+        target_user: String,
+        /// Private key for the target host (publickey auth).
+        #[arg(long)]
+        target_key: Option<String>,
+        /// Env var holding the target password (dev-only).
+        #[arg(long, default_value = "NEXTERM_TARGET_PASSWORD")]
+        target_password_env: String,
+        /// Remote directory to list on the target.
+        #[arg(long, default_value = "/")]
+        path: String,
+        /// Disable known_hosts checking for both hops (accept unknown keys).
+        #[arg(long)]
+        insecure: bool,
+    },
     /// Show highlight spans for a line of text.
     Highlight { text: String },
     /// Check a command against the multi-exec danger rules.
@@ -251,6 +314,47 @@ async fn main() -> anyhow::Result<()> {
                 target,
                 insecure,
             )
+            .await
+        }
+        #[cfg(feature = "ssh-russh")]
+        Command::SftpLs {
+            host,
+            port,
+            user,
+            key,
+            password_env,
+            path,
+            insecure,
+        } => cmd_sftp_ls(host, port, user, key, password_env, path, insecure).await,
+        #[cfg(feature = "ssh-russh")]
+        Command::SftpJumpLs {
+            jump_host,
+            jump_port,
+            jump_user,
+            jump_key,
+            jump_password_env,
+            target_host,
+            target_port,
+            target_user,
+            target_key,
+            target_password_env,
+            path,
+            insecure,
+        } => {
+            cmd_sftp_jump_ls(SftpJumpArgs {
+                jump_host,
+                jump_port,
+                jump_user,
+                jump_key,
+                jump_password_env,
+                target_host,
+                target_port,
+                target_user,
+                target_key,
+                target_password_env,
+                path,
+                insecure,
+            })
             .await
         }
         Command::Highlight { text } => cmd_highlight(text),
@@ -497,7 +601,7 @@ fn split_host_port(s: &str) -> anyhow::Result<(String, u16)> {
 
 #[cfg(feature = "ssh-russh")]
 async fn cmd_ssh_jump_connect(a: JumpArgs) -> anyhow::Result<()> {
-    use rrs_protocols::RusshConnector;
+    use rrs_protocols::{Connector, RusshConnector};
 
     let strict = !a.insecure;
     let jump = ssh_profile(
@@ -606,6 +710,101 @@ async fn cmd_tunnel_local(
         .await
         .map_err(|e| anyhow::anyhow!("stopping tunnel: {e}"))?;
     println!("tunnel stopped.");
+    Ok(())
+}
+
+/// Print an SFTP directory listing (one entry per line).
+#[cfg(feature = "ssh-russh")]
+fn print_listing(path: &str, entries: &[rrs_protocols::DirEntry]) {
+    use rrs_protocols::EntryKind;
+    println!("{path}:");
+    for e in entries {
+        let kind = match e.kind {
+            EntryKind::Dir => 'd',
+            EntryKind::Symlink => 'l',
+            EntryKind::File => '-',
+            EntryKind::Other => '?',
+        };
+        println!("  {kind} {:>12} {}", e.size, e.name);
+    }
+    println!("({} entries)", entries.len());
+}
+
+#[cfg(feature = "ssh-russh")]
+#[allow(clippy::too_many_arguments)]
+async fn cmd_sftp_ls(
+    host: String,
+    port: u16,
+    user: String,
+    key: Option<String>,
+    password_env: String,
+    path: String,
+    insecure: bool,
+) -> anyhow::Result<()> {
+    use rrs_protocols::{RusshSftp, SftpClient};
+
+    let profile = ssh_profile("sftp", &host, port, &user, key, !insecure);
+    let creds = creds_from_env(&password_env);
+
+    println!("opening SFTP to {host}:{port} ...");
+    let sftp = RusshSftp::connect(&profile, &creds)
+        .await
+        .context("sftp connect")?;
+    let entries = sftp.list_dir(&path).await.context("list_dir")?;
+    print_listing(&path, &entries);
+    Ok(())
+}
+
+/// Grouped args for the SFTP-via-jump command.
+#[cfg(feature = "ssh-russh")]
+struct SftpJumpArgs {
+    jump_host: String,
+    jump_port: u16,
+    jump_user: String,
+    jump_key: Option<String>,
+    jump_password_env: String,
+    target_host: String,
+    target_port: u16,
+    target_user: String,
+    target_key: Option<String>,
+    target_password_env: String,
+    path: String,
+    insecure: bool,
+}
+
+#[cfg(feature = "ssh-russh")]
+async fn cmd_sftp_jump_ls(a: SftpJumpArgs) -> anyhow::Result<()> {
+    use rrs_protocols::{RusshSftp, SftpClient};
+
+    let strict = !a.insecure;
+    let jump = ssh_profile(
+        "jump",
+        &a.jump_host,
+        a.jump_port,
+        &a.jump_user,
+        a.jump_key,
+        strict,
+    );
+    let target = ssh_profile(
+        "target",
+        &a.target_host,
+        a.target_port,
+        &a.target_user,
+        a.target_key,
+        strict,
+    );
+    let jump_creds = creds_from_env(&a.jump_password_env);
+    let target_creds = creds_from_env(&a.target_password_env);
+
+    println!(
+        "opening SFTP to {}:{} via jump host {}:{} ...",
+        a.target_host, a.target_port, a.jump_host, a.jump_port
+    );
+    let sftp = RusshSftp::connect_via_jump(&jump, &jump_creds, &target, &target_creds)
+        .await
+        .context("sftp via jump connect")?;
+    let entries = sftp.list_dir(&a.path).await.context("list_dir")?;
+    print_listing(&a.path, &entries);
     Ok(())
 }
 

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use rrs_core::model::ConnectionProfile;
 use rrs_credentials::Secret;
 
-use crate::error::Result;
+use crate::error::{ProtocolError, Result};
 
 /// Secrets resolved transiently for a single connection attempt.
 ///
@@ -47,6 +47,12 @@ pub trait RemoteSession: Send {
 }
 
 /// Opens connections for a particular protocol.
+///
+/// The jump-host and SFTP methods have default implementations that report
+/// `NotImplemented`, so a connector only overrides what it actually supports.
+/// Orchestration (resolving the second hop's profile + secret) lives in the
+/// caller — a `Connector` is handed fully-resolved profiles and credentials and
+/// never touches the profile/credential stores itself.
 #[async_trait]
 pub trait Connector: Send + Sync {
     /// Open an interactive shell using `profile` and transient `creds`.
@@ -55,6 +61,48 @@ pub trait Connector: Send + Sync {
         profile: &ConnectionProfile,
         creds: &ResolvedCredentials,
     ) -> Result<Box<dyn RemoteSession>>;
+
+    /// Open an interactive shell on `target` by tunnelling through the gateway
+    /// `jump` (single-hop `ProxyJump`). Each hop carries its own transient
+    /// credentials. Both hosts are verified independently.
+    async fn connect_shell_via_jump(
+        &self,
+        jump: &ConnectionProfile,
+        jump_creds: &ResolvedCredentials,
+        target: &ConnectionProfile,
+        target_creds: &ResolvedCredentials,
+    ) -> Result<Box<dyn RemoteSession>> {
+        let _ = (jump, jump_creds, target, target_creds);
+        Err(ProtocolError::NotImplemented(
+            "jump-host shell is not supported by this connector",
+        ))
+    }
+
+    /// Open an SFTP client for `profile` using transient `creds`.
+    async fn connect_sftp(
+        &self,
+        profile: &ConnectionProfile,
+        creds: &ResolvedCredentials,
+    ) -> Result<Box<dyn SftpClient>> {
+        let _ = (profile, creds);
+        Err(ProtocolError::NotImplemented(
+            "SFTP is not supported by this connector",
+        ))
+    }
+
+    /// Open an SFTP client on `target` through the gateway `jump` (single-hop).
+    async fn connect_sftp_via_jump(
+        &self,
+        jump: &ConnectionProfile,
+        jump_creds: &ResolvedCredentials,
+        target: &ConnectionProfile,
+        target_creds: &ResolvedCredentials,
+    ) -> Result<Box<dyn SftpClient>> {
+        let _ = (jump, jump_creds, target, target_creds);
+        Err(ProtocolError::NotImplemented(
+            "SFTP over a jump host is not supported by this connector",
+        ))
+    }
 }
 
 /// Kind of a remote filesystem entry.

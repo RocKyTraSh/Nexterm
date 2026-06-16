@@ -13,9 +13,9 @@
 //! * an interactive PTY shell exposed as [`RemoteSession`];
 //! * SFTP (`list_dir` / `stat` / `read_file` / `write_file` / `mkdir` /
 //!   `remove` / `rename` / `chmod`) via [`RusshSftp`];
-//! * single-hop jump-host (`ProxyJump`) chaining over a `direct-tcpip` channel
-//!   ([`SshConnection::connect_via_jump_host`] +
-//!   [`RusshConnector::connect_shell_via_jump`]);
+//! * single-hop jump-host (`ProxyJump`) chaining over a `direct-tcpip` channel,
+//!   for both **shell** ([`Connector::connect_shell_via_jump`]) and **SFTP**
+//!   ([`RusshSftp::connect_via_jump`] / [`Connector::connect_sftp_via_jump`]);
 //! * a reusable `direct-tcpip` forwarding stream ([`SshConnection::open_forward_stream`])
 //!   that backs the `rrs-tunnels` russh driver.
 //!
@@ -26,8 +26,6 @@
 //!
 //! Not yet implemented (clear errors / TODOs, no fake behavior):
 //! * multi-hop jump-host chains (length > 1) — only one gateway is supported;
-//! * SFTP *through* a jump host (the seam exists via [`SshConnection::open_sftp`]
-//!   but is not wired into [`RusshSftp::connect`]);
 //! * agent forwarding into the channel.
 //!
 //! Secrets: passwords / passphrases come from [`ResolvedCredentials`] only, are
@@ -374,17 +372,38 @@ pub fn validate_jump_chain(jump: &SshSettings, target: &SshSettings) -> Result<(
 #[derive(Default)]
 pub struct RusshConnector;
 
-impl RusshConnector {
+#[async_trait]
+impl Connector for RusshConnector {
+    async fn connect_shell(
+        &self,
+        profile: &ConnectionProfile,
+        creds: &ResolvedCredentials,
+    ) -> Result<Box<dyn RemoteSession>> {
+        let ssh = ssh_settings(profile)?;
+        if ssh.jump_host.is_some() {
+            // A jump host is referenced by another profile's id; resolving that
+            // profile (and its secret) needs the profile/credential stores,
+            // which the `Connector` trait deliberately does not expose. The
+            // orchestration layer (`AppCore`) resolves both hops and calls
+            // `connect_shell_via_jump` instead.
+            return Err(ProtocolError::NotImplemented(
+                "jump-host shell from a single profile — the orchestration layer must resolve \
+                 both hops and call Connector::connect_shell_via_jump",
+            ));
+        }
+
+        Ok(Box::new(
+            SshConnection::connect(ssh, creds)
+                .await?
+                .open_shell()
+                .await?,
+        ))
+    }
+
     /// Connect to `target` through the gateway `jump`, returning a shell on the
-    /// **target** (not the gateway).
-    ///
-    /// This is the resolved-endpoints entry point: the caller (orchestration
-    /// layer / dev harness) supplies both fully-built profiles and their
-    /// transient credentials. The trait-level [`connect_shell`](Connector::connect_shell)
-    /// only receives one profile, so it cannot resolve the second hop's profile
-    /// and secret through the `Connector` boundary — it reports that and points
-    /// here instead.
-    pub async fn connect_shell_via_jump(
+    /// **target** (not the gateway). Both hops are verified and authenticated
+    /// independently from their own profile + transient credentials.
+    async fn connect_shell_via_jump(
         &self,
         jump: &ConnectionProfile,
         jump_creds: &ResolvedCredentials,
@@ -398,34 +417,24 @@ impl RusshConnector {
                 .await?;
         Ok(Box::new(conn.open_shell().await?))
     }
-}
 
-#[async_trait]
-impl Connector for RusshConnector {
-    async fn connect_shell(
+    async fn connect_sftp(
         &self,
         profile: &ConnectionProfile,
         creds: &ResolvedCredentials,
-    ) -> Result<Box<dyn RemoteSession>> {
-        let ssh = ssh_settings(profile)?;
-        if ssh.jump_host.is_some() {
-            // A jump host is referenced by another profile's id; resolving that
-            // profile (and its secret) needs the profile/credential stores,
-            // which the `Connector` trait deliberately does not expose. The
-            // orchestration layer must resolve both hops and call
-            // `connect_shell_via_jump`.
-            return Err(ProtocolError::NotImplemented(
-                "jump-host shell from a single profile — resolve both hops and call \
-                 RusshConnector::connect_shell_via_jump (the real chaining lives in \
-                 SshConnection::connect_via_jump_host)",
-            ));
-        }
+    ) -> Result<Box<dyn SftpClient>> {
+        Ok(Box::new(RusshSftp::connect(profile, creds).await?))
+    }
 
+    async fn connect_sftp_via_jump(
+        &self,
+        jump: &ConnectionProfile,
+        jump_creds: &ResolvedCredentials,
+        target: &ConnectionProfile,
+        target_creds: &ResolvedCredentials,
+    ) -> Result<Box<dyn SftpClient>> {
         Ok(Box::new(
-            SshConnection::connect(ssh, creds)
-                .await?
-                .open_shell()
-                .await?,
+            RusshSftp::connect_via_jump(jump, jump_creds, target, target_creds).await?,
         ))
     }
 }
@@ -659,19 +668,39 @@ pub struct RusshSftp {
 }
 
 impl RusshSftp {
-    /// Open an SFTP session for `profile` using transient `creds`.
+    /// Open a direct (non-jump) SFTP session for `profile` using transient
+    /// `creds`.
     ///
-    /// SFTP *through* a jump host is not wired up here yet (the primitive exists
-    /// via [`SshConnection::connect_via_jump_host`] + [`SshConnection::open_sftp`]).
+    /// A profile that names a jump host is rejected here on purpose: resolving
+    /// the gateway profile + secret is the orchestration layer's job. Use
+    /// [`connect_via_jump`](Self::connect_via_jump) (or
+    /// [`Connector::connect_sftp_via_jump`]) with both hops resolved instead.
     pub async fn connect(profile: &ConnectionProfile, creds: &ResolvedCredentials) -> Result<Self> {
         let ssh = ssh_settings(profile)?;
         if ssh.jump_host.is_some() {
             return Err(ProtocolError::NotImplemented(
-                "SFTP over a jump host — resolve both hops and use \
-                 SshConnection::connect_via_jump_host(...).open_sftp()",
+                "SFTP from a single jump-host profile — the orchestration layer must resolve \
+                 both hops and call RusshSftp::connect_via_jump",
             ));
         }
         SshConnection::connect(ssh, creds).await?.open_sftp().await
+    }
+
+    /// Open an SFTP session on `target` through the gateway `jump` (single-hop).
+    /// Reuses [`SshConnection::connect_via_jump_host`], so auth and host-key
+    /// policy are identical to the shell path (no duplication).
+    pub async fn connect_via_jump(
+        jump: &ConnectionProfile,
+        jump_creds: &ResolvedCredentials,
+        target: &ConnectionProfile,
+        target_creds: &ResolvedCredentials,
+    ) -> Result<Self> {
+        let jump_ssh = ssh_settings(jump)?;
+        let target_ssh = ssh_settings(target)?;
+        SshConnection::connect_via_jump_host(jump_ssh, jump_creds, target_ssh, target_creds)
+            .await?
+            .open_sftp()
+            .await
     }
 }
 
@@ -1009,5 +1038,45 @@ mod tests {
         let text = String::from_utf8_lossy(&out);
         assert!(text.contains("JUMP_OK"), "unexpected target output: {text}");
         session.close().await.expect("close");
+    }
+
+    /// Live single-hop **SFTP**-through-jump round-trip. Ignored by default
+    /// (needs two reachable sshd endpoints, gateway able to reach the target).
+    /// Lists a directory on the target via SFTP tunnelled through the gateway.
+    /// Run with publickey auth, e.g.:
+    ///
+    /// ```text
+    /// NEXTERM_JUMP_TEST_HOST=gw.example   NEXTERM_JUMP_TEST_USER=$USER \
+    /// NEXTERM_JUMP_TEST_KEY=$HOME/.ssh/id_ed25519 \
+    /// NEXTERM_TARGET_TEST_HOST=10.0.0.5   NEXTERM_TARGET_TEST_USER=root \
+    /// NEXTERM_TARGET_TEST_KEY=$HOME/.ssh/id_ed25519 \
+    /// NEXTERM_TARGET_TEST_SFTP_PATH=/tmp \
+    /// cargo test -p rrs-protocols --features ssh-russh -- --ignored sftp_jump_roundtrip
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires two reachable sshd endpoints; see doc comment"]
+    async fn sftp_jump_roundtrip() {
+        fn hop(prefix: &str) -> (ConnectionProfile, ResolvedCredentials) {
+            let host = std::env::var(format!("{prefix}_HOST")).expect("HOST");
+            let user = std::env::var(format!("{prefix}_USER")).expect("USER");
+            let key = std::env::var(format!("{prefix}_KEY")).ok();
+            let mut profile = ConnectionProfile::new_ssh(prefix, &host, &user);
+            if let ProtocolSettings::Ssh(s) = &mut profile.settings {
+                s.private_key_path = key;
+                s.strict_host_key_checking = false;
+            }
+            (profile, ResolvedCredentials::default())
+        }
+
+        let (jump, jump_creds) = hop("NEXTERM_JUMP_TEST");
+        let (target, target_creds) = hop("NEXTERM_TARGET_TEST");
+        let path = std::env::var("NEXTERM_TARGET_TEST_SFTP_PATH").unwrap_or_else(|_| "/".into());
+
+        let sftp = RusshSftp::connect_via_jump(&jump, &jump_creds, &target, &target_creds)
+            .await
+            .expect("sftp via jump connect");
+        // Listing must succeed; "." / ".." are usually present but not required.
+        let listing = sftp.list_dir(&path).await.expect("list_dir over jump");
+        println!("listed {} entries in {path} via jump host", listing.len());
     }
 }

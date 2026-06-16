@@ -32,7 +32,10 @@
       "Bash(git commit *)",
       "Read(//home/rockytrash/.cargo/**)",
       "Bash(find / -maxdepth 8 -type d -name 'russh-0.61*')",
-      "Bash(cargo tree *)"
+      "Bash(cargo tree *)",
+      "Bash(./target/debug/rrs --help)",
+      "Bash(./target/debug/rrs sftp-jump-ls *)",
+      "Bash(./target/debug/rrs sftp-ls *)"
     ]
   }
 }
