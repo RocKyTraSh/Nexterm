@@ -1,23 +1,27 @@
-//! Real port-forwarding driver over an SSH session (feature `ssh-russh`).
+//! Real port-forwarding driver over an SSH session (feature `ssh-russh`),
+//! supporting all three forwarding kinds:
+//! * **Local** (`ssh -L`): a local listener; each connection opens a
+//!   `direct-tcpip` channel to a fixed `host:port` from the spec;
+//! * **Dynamic** (`ssh -D`): a local SOCKS5 proxy — each connection negotiates
+//!   its own destination over `direct-tcpip` (see [`crate::socks5`]);
+//! * **Remote** (`ssh -R`): the server listens (`tcpip-forward`) and opens a
+//!   `forwarded-tcpip` channel back to us per connection; we dial the local
+//!   target and pump bytes. The `forwarded-tcpip` channels arrive through the
+//!   SSH connection's handler (see [`rrs_protocols::ForwardedConnection`]).
 //!
-//! Binds a local TCP listener and, for every accepted connection, opens a
-//! `direct-tcpip` channel on a shared SSH connection and pumps bytes both ways
-//! with [`tokio::io::copy_bidirectional`]. The destination depends on the kind:
-//! * **Local** (`ssh -L`): a fixed `host:port` from the spec;
-//! * **Dynamic** (`ssh -D`): a SOCKS5 proxy — each connection negotiates its own
-//!   destination (see [`crate::socks5`]).
-//!
-//! Scope (minimal, by design):
-//! * Remote (`-R`) returns [`TunnelError::Unsupported`].
-//! * One driver holds **one** SSH connection and forwards every spec over it;
-//!   the spec's `ssh_profile_id` is not re-resolved here (that belongs to the
-//!   orchestration layer). Construct one driver per SSH endpoint.
+//! Bytes are pumped both ways with [`tokio::io::copy_bidirectional`]. One driver
+//! holds **one** SSH connection and forwards every spec over it; the spec's
+//! `ssh_profile_id` is not re-resolved here (that belongs to the orchestration
+//! layer). Construct one driver per SSH endpoint. A single SSH connection hosts
+//! at most one active remote (`-R`) forward (the forwarded-channel receiver is
+//! taken once).
 //!
 //! Lifecycle / safety:
-//! * each tunnel runs an accept loop plus one task per live connection;
+//! * each tunnel runs an accept/forwarded loop plus one task per live connection;
 //! * [`stop`](RusshTunnelDriver::stop) signals every task (via a broadcast
-//!   channel) and aborts the accept loop — no task is left looping;
-//! * dropping the driver aborts the accept loops best-effort;
+//!   channel), aborts the loop, and (for `-R`) cancels the server-side bind —
+//!   no task is left looping;
+//! * dropping the driver aborts the loops best-effort;
 //! * nothing blocks the async runtime, and no secret is logged.
 
 use std::collections::HashMap;
@@ -27,28 +31,42 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use rrs_core::model::SshSettings;
-use rrs_protocols::{ResolvedCredentials, SshConnection};
+use rrs_protocols::{ForwardedConnection, ResolvedCredentials, SshConnection};
 
 use crate::error::{Result, TunnelError};
 use crate::manager::{TunnelDriver, TunnelKind, TunnelSpec};
 use crate::socks5;
 
-/// What a tunnel's accepted connections should do.
+/// The forwarding kind resolved from a spec (pure; unit-tested).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ForwardMode {
-    /// `-L`: every connection forwards to a fixed `host:port`.
+    /// `-L`: every local connection forwards to a fixed `host:port`.
     Local { host: String, port: u16 },
-    /// `-D`: every connection is a SOCKS5 request choosing its own destination.
+    /// `-D`: every local connection is a SOCKS5 request choosing its destination.
+    Dynamic,
+    /// `-R`: the server listens on `remote_*` and forwards connections back to
+    /// us; we connect them to `local_*` on this machine.
+    Remote {
+        remote_host: String,
+        remote_port: u16,
+        local_host: String,
+        local_port: u16,
+    },
+}
+
+/// What an *accepted local* connection should do (the listener-based modes).
+#[derive(Debug, Clone)]
+enum ConnMode {
+    Local { host: String, port: u16 },
     Dynamic,
 }
 
-/// Decide the forwarding mode for a spec (pure; unit-tested). Remote (`-R`) is
-/// not implemented yet.
+/// Decide the forwarding mode for a spec (pure; unit-tested).
 fn forward_mode_for(spec: &TunnelSpec) -> Result<ForwardMode> {
     match spec.kind {
         TunnelKind::Local => {
@@ -56,9 +74,16 @@ fn forward_mode_for(spec: &TunnelSpec) -> Result<ForwardMode> {
             Ok(ForwardMode::Local { host, port })
         }
         TunnelKind::Dynamic => Ok(ForwardMode::Dynamic),
-        TunnelKind::Remote => Err(TunnelError::Unsupported(
-            "remote forwarding (ssh -R)".into(),
-        )),
+        TunnelKind::Remote => {
+            let ((remote_host, remote_port), (local_host, local_port)) =
+                spec.remote_forward_endpoints()?;
+            Ok(ForwardMode::Remote {
+                remote_host,
+                remote_port,
+                local_host,
+                local_port,
+            })
+        }
     }
 }
 
@@ -66,7 +91,11 @@ fn forward_mode_for(spec: &TunnelSpec) -> Result<ForwardMode> {
 struct RunningTunnel {
     /// Send `()` (or drop) to ask the accept loop and all forwards to stop.
     shutdown: broadcast::Sender<()>,
+    /// The accept loop (local listener) or the forwarded-channel loop (remote).
     accept_task: JoinHandle<()>,
+    /// For remote (`-R`) forwards: the `(bind address, assigned port)` to cancel
+    /// on the server when stopping.
+    remote_cancel: Option<(String, u16)>,
 }
 
 /// Local port-forwarding driver over a single shared SSH connection.
@@ -99,13 +128,15 @@ impl RusshTunnelDriver {
     }
 }
 
-#[async_trait]
-impl TunnelDriver for RusshTunnelDriver {
-    async fn start(&self, spec: &TunnelSpec) -> Result<()> {
+impl RusshTunnelDriver {
+    /// Bind a local listener for `-L`/`-D` and spawn its accept loop.
+    async fn spawn_listener(
+        &self,
+        spec: &TunnelSpec,
+        mode: ConnMode,
+        shutdown: &broadcast::Sender<()>,
+    ) -> Result<JoinHandle<()>> {
         let (bind_addr, bind_port) = spec.bind_endpoint()?;
-        // Errors for Remote (`-R`) and for a Local spec missing its target.
-        let mode = forward_mode_for(spec)?;
-
         let listener = TcpListener::bind((bind_addr.as_str(), bind_port))
             .await
             .map_err(|e| {
@@ -115,30 +146,111 @@ impl TunnelDriver for RusshTunnelDriver {
             .local_addr()
             .map_err(|e| TunnelError::Driver(e.to_string()))?;
         match &mode {
-            ForwardMode::Local { host, port } => tracing::info!(
+            ConnMode::Local { host, port } => tracing::info!(
                 tunnel = %spec.id, name = %spec.name, bind = %local,
                 target = %format!("{host}:{port}"), "local forward started"
             ),
-            ForwardMode::Dynamic => tracing::info!(
+            ConnMode::Dynamic => tracing::info!(
                 tunnel = %spec.id, name = %spec.name, bind = %local,
                 "dynamic SOCKS proxy started"
             ),
         }
-
-        let (shutdown, _) = broadcast::channel::<()>(1);
-        let accept_task = tokio::spawn(accept_loop(
+        Ok(tokio::spawn(accept_loop(
             listener,
             self.conn.clone(),
             mode,
             shutdown.clone(),
             spec.id,
+        )))
+    }
+
+    /// Request a remote (`-R`) forward and spawn the loop handling the
+    /// `forwarded-tcpip` channels the server opens back to us.
+    async fn spawn_remote(
+        &self,
+        spec: &TunnelSpec,
+        remote_host: String,
+        remote_port: u16,
+        local_host: String,
+        local_port: u16,
+        shutdown: &broadcast::Sender<()>,
+    ) -> Result<(JoinHandle<()>, Option<(String, u16)>)> {
+        // Take the receiver first so a second remote forward fails cleanly
+        // before we ask the server to bind.
+        let rx = self
+            .conn
+            .take_forwarded_connections()
+            .await
+            .ok_or_else(|| {
+                TunnelError::Driver(
+                    "a remote forward is already active on this SSH connection".into(),
+                )
+            })?;
+        let assigned = self
+            .conn
+            .request_remote_forward(&remote_host, remote_port)
+            .await
+            .map_err(|e| TunnelError::Driver(e.to_string()))?;
+        tracing::info!(
+            tunnel = %spec.id, name = %spec.name,
+            remote_bind = %format!("{remote_host}:{assigned}"),
+            local_target = %format!("{local_host}:{local_port}"),
+            "remote forward started"
+        );
+        let task = tokio::spawn(forwarded_loop(
+            rx,
+            local_host,
+            local_port,
+            self.conn.clone(),
+            shutdown.clone(),
+            spec.id,
         ));
+        Ok((task, Some((remote_host, assigned))))
+    }
+}
+
+#[async_trait]
+impl TunnelDriver for RusshTunnelDriver {
+    async fn start(&self, spec: &TunnelSpec) -> Result<()> {
+        // Resolves endpoints; errors for malformed specs before any I/O.
+        let mode = forward_mode_for(spec)?;
+        let (shutdown, _) = broadcast::channel::<()>(1);
+
+        let (accept_task, remote_cancel) = match mode {
+            ForwardMode::Local { host, port } => (
+                self.spawn_listener(spec, ConnMode::Local { host, port }, &shutdown)
+                    .await?,
+                None,
+            ),
+            ForwardMode::Dynamic => (
+                self.spawn_listener(spec, ConnMode::Dynamic, &shutdown)
+                    .await?,
+                None,
+            ),
+            ForwardMode::Remote {
+                remote_host,
+                remote_port,
+                local_host,
+                local_port,
+            } => {
+                self.spawn_remote(
+                    spec,
+                    remote_host,
+                    remote_port,
+                    local_host,
+                    local_port,
+                    &shutdown,
+                )
+                .await?
+            }
+        };
 
         self.running.lock().expect("tunnel map poisoned").insert(
             spec.id,
             RunningTunnel {
                 shutdown,
                 accept_task,
+                remote_cancel,
             },
         );
         Ok(())
@@ -151,10 +263,14 @@ impl TunnelDriver for RusshTunnelDriver {
             .expect("tunnel map poisoned")
             .remove(&id);
         if let Some(rt) = running {
-            // Signal every forward task, then make sure the accept loop is gone.
+            // Signal every forward task, then make sure the loop is gone.
             let _ = rt.shutdown.send(());
             rt.accept_task.abort();
             let _ = rt.accept_task.await;
+            // For remote forwards, ask the server to stop listening.
+            if let Some((addr, port)) = rt.remote_cancel {
+                self.conn.cancel_remote_forward(&addr, port).await;
+            }
             tracing::info!(tunnel = %id, "forward stopped");
         }
         Ok(())
@@ -177,7 +293,7 @@ impl Drop for RusshTunnelDriver {
 async fn accept_loop(
     listener: TcpListener,
     conn: Arc<SshConnection>,
-    mode: ForwardMode,
+    mode: ConnMode,
     shutdown: broadcast::Sender<()>,
     id: Uuid,
 ) {
@@ -209,16 +325,16 @@ async fn accept_loop(
 async fn handle_conn(
     conn: Arc<SshConnection>,
     sock: TcpStream,
-    mode: ForwardMode,
+    mode: ConnMode,
     shutdown_rx: broadcast::Receiver<()>,
     id: Uuid,
     peer: SocketAddr,
 ) {
     match mode {
-        ForwardMode::Local { host, port } => {
+        ConnMode::Local { host, port } => {
             forward_local(conn, sock, host, port, shutdown_rx, id, peer).await
         }
-        ForwardMode::Dynamic => forward_dynamic(conn, sock, shutdown_rx, id, peer).await,
+        ConnMode::Dynamic => forward_dynamic(conn, sock, shutdown_rx, id, peer).await,
     }
 }
 
@@ -299,6 +415,70 @@ async fn forward_dynamic(
     pump_until_stop(&mut sock, &mut stream, &mut shutdown_rx, id, peer).await;
 }
 
+/// Remote (`-R`) loop: receive `forwarded-tcpip` channels the server opens back
+/// to us and connect each to the local target. Holds the `SshConnection` alive
+/// for its lifetime (the channels' sender lives in the connection's handler).
+async fn forwarded_loop(
+    mut rx: mpsc::UnboundedReceiver<ForwardedConnection>,
+    local_host: String,
+    local_port: u16,
+    _conn: Arc<SshConnection>,
+    shutdown: broadcast::Sender<()>,
+    id: Uuid,
+) {
+    let mut shutdown_rx = shutdown.subscribe();
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => break,
+            maybe = rx.recv() => match maybe {
+                Some(fwd) => {
+                    tokio::spawn(handle_forwarded(
+                        fwd,
+                        local_host.clone(),
+                        local_port,
+                        shutdown.subscribe(),
+                        id,
+                    ));
+                }
+                None => {
+                    // Sender dropped → the SSH connection is gone.
+                    tracing::warn!(tunnel = %id, "remote forward source closed (SSH connection ended)");
+                    break;
+                }
+            },
+        }
+    }
+}
+
+/// One incoming forwarded connection: dial the local target and pump bytes.
+async fn handle_forwarded(
+    mut fwd: ForwardedConnection,
+    local_host: String,
+    local_port: u16,
+    mut shutdown_rx: broadcast::Receiver<()>,
+    id: Uuid,
+) {
+    let origin = format!("{}:{}", fwd.originator_address, fwd.originator_port);
+    let mut local = match TcpStream::connect((local_host.as_str(), local_port)).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                tunnel = %id, origin = %origin,
+                "remote forward: local connect to {local_host}:{local_port} failed: {e}"
+            );
+            // Dropping fwd.stream closes the SSH channel.
+            return;
+        }
+    };
+    tokio::select! {
+        res = copy_bidirectional(&mut local, &mut fwd.stream) => match res {
+            Ok((up, down)) => tracing::debug!(tunnel = %id, origin = %origin, up, down, "remote forward closed"),
+            Err(e) => tracing::debug!(tunnel = %id, origin = %origin, "remote forward error: {e}"),
+        },
+        _ = shutdown_rx.recv() => tracing::debug!(tunnel = %id, origin = %origin, "remote forward cancelled by stop"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,19 +501,31 @@ mod tests {
         let dynamic = TunnelSpec::new_dynamic("d", profile, "127.0.0.1", 1080);
         assert_eq!(forward_mode_for(&dynamic).unwrap(), ForwardMode::Dynamic);
 
-        // Remote (`-R`) is not implemented yet.
-        let mut remote = TunnelSpec::new_local("r", profile, 8080, "x", 1);
-        remote.kind = TunnelKind::Remote;
-        assert!(matches!(
-            forward_mode_for(&remote),
-            Err(TunnelError::Unsupported(_))
-        ));
+        // Remote (`-R`): remote bind + local target.
+        let remote = TunnelSpec::new_remote("r", profile, "127.0.0.1", 18080, "127.0.0.1", 8080);
+        assert_eq!(
+            forward_mode_for(&remote).unwrap(),
+            ForwardMode::Remote {
+                remote_host: "127.0.0.1".into(),
+                remote_port: 18080,
+                local_host: "127.0.0.1".into(),
+                local_port: 8080,
+            }
+        );
 
         // A Local spec missing its target is rejected before any socket opens.
         let mut bad_local = TunnelSpec::new_local("b", profile, 8080, "x", 1);
         bad_local.target_host = None;
         assert!(matches!(
             forward_mode_for(&bad_local),
+            Err(TunnelError::InvalidSpec(_))
+        ));
+
+        // A Remote spec missing its local target is rejected.
+        let mut bad_remote = TunnelSpec::new_remote("br", profile, "127.0.0.1", 1, "x", 1);
+        bad_remote.target_port = None;
+        assert!(matches!(
+            forward_mode_for(&bad_remote),
             Err(TunnelError::InvalidSpec(_))
         ));
     }
@@ -476,5 +668,99 @@ mod tests {
         );
 
         mgr.stop(id).await.expect("stop socks");
+    }
+
+    /// Live remote-forward round-trip against a real sshd. Ignored by default
+    /// (needs a server where `AllowTcpForwarding` permits remote forwarding).
+    /// Starts a local TCP echo server, requests a remote bind on the server, and
+    /// connects to that bind *through the SSH connection itself* (a direct-tcpip
+    /// to the remote bind) — the server then forwards back to our echo server.
+    /// Verifies the echo. Run e.g.:
+    ///
+    /// ```text
+    /// NEXTERM_SSH_TEST_HOST=127.0.0.1 NEXTERM_SSH_TEST_USER=$USER \
+    /// NEXTERM_SSH_TEST_KEY=$HOME/.ssh/id_ed25519 \
+    /// NEXTERM_REMOTE_TEST_BIND=127.0.0.1:18080 \
+    /// cargo test -p rrs-tunnels --features ssh-russh -- --ignored remote_tunnel_roundtrip
+    /// ```
+    ///
+    /// `NEXTERM_REMOTE_TEST_BIND` (default `127.0.0.1:18080`) is the remote bind;
+    /// the local target is the echo server this test starts. `GatewayPorts` only
+    /// matters when binding the remote side to a non-loopback address.
+    #[tokio::test]
+    #[ignore = "requires a reachable sshd with TCP forwarding; see doc comment"]
+    async fn remote_tunnel_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let host = std::env::var("NEXTERM_SSH_TEST_HOST").expect("NEXTERM_SSH_TEST_HOST");
+        let user = std::env::var("NEXTERM_SSH_TEST_USER").expect("NEXTERM_SSH_TEST_USER");
+        let key = std::env::var("NEXTERM_SSH_TEST_KEY").expect("NEXTERM_SSH_TEST_KEY");
+        let ssh_port: u16 = std::env::var("NEXTERM_SSH_TEST_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(22);
+        let remote_bind =
+            std::env::var("NEXTERM_REMOTE_TEST_BIND").unwrap_or_else(|_| "127.0.0.1:18080".into());
+        let (rbind_host, rbind_port) = remote_bind.rsplit_once(':').expect("host:port");
+        let rbind_port: u16 = rbind_port.parse().expect("port");
+
+        // Local echo server (the `-R` local target).
+        let echo = TcpListener::bind("127.0.0.1:0").await.expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let mut b = [0u8; 1024];
+                    while let Ok(n) = c.read(&mut b).await {
+                        if n == 0 || c.write_all(&b[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let ssh = SshSettings {
+            host: host.clone(),
+            port: ssh_port,
+            username: user,
+            private_key_path: Some(key),
+            strict_host_key_checking: false,
+            ..SshSettings::default()
+        };
+        // Keep a second connection to reach the remote bind for the test probe.
+        let probe_conn = Arc::new(
+            SshConnection::connect(&ssh, &ResolvedCredentials::default())
+                .await
+                .expect("probe ssh connect"),
+        );
+        let driver = RusshTunnelDriver::connect(&ssh, &ResolvedCredentials::default())
+            .await
+            .expect("ssh connect");
+        let mut mgr = TunnelManager::new(Box::new(driver));
+
+        let spec = TunnelSpec::new_remote(
+            "remote",
+            Uuid::new_v4(),
+            rbind_host,
+            rbind_port,
+            "127.0.0.1",
+            echo_addr.port(),
+        );
+        let id = mgr.add(spec);
+        mgr.start(id).await.expect("start remote forward");
+
+        // Connect to the remote bind (from the server's perspective) via the
+        // probe connection's direct-tcpip, then echo a payload.
+        let mut stream = probe_conn
+            .open_forward_stream(rbind_host, rbind_port)
+            .await
+            .expect("reach remote bind");
+        stream.write_all(b"ping").await.expect("write");
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.expect("read echo");
+        assert_eq!(&buf, b"ping", "echo through remote forward mismatch");
+
+        mgr.stop(id).await.expect("stop remote forward");
     }
 }

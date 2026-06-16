@@ -41,7 +41,11 @@
       "Bash(NEXTERM_TARGET_PASSWORD=x ./target/debug/rrs ssh-chain-connect --jump gw1 --target t:u)",
       "Bash(echo \"default build: $\\(cargo build --workspace 2>&1)",
       "Bash(./target/debug/rrs tunnel-socks *)",
-      "Bash(NEXTERM_SSH_PASSWORD=x ./target/debug/rrs tunnel-socks --ssh-host 127.0.0.1 --ssh-user u --bind nope)"
+      "Bash(NEXTERM_SSH_PASSWORD=x ./target/debug/rrs tunnel-socks --ssh-host 127.0.0.1 --ssh-user u --bind nope)",
+      "Bash(sed -i 's/pub use russh_impl::{DirectTcpipStream, RusshConnector, RusshSession, RusshSftp, SshConnection};/pub use russh_impl::{\\\\n    DirectTcpipStream, ForwardedConnection, RusshConnector, RusshSession, RusshSftp, SshConnection,\\\\n};/' crates/protocols/src/ssh/mod.rs)",
+      "Bash(sed -i 's/pub use ssh::{DirectTcpipStream, RusshConnector, RusshSftp, SshConnection};/pub use ssh::{\\\\n    DirectTcpipStream, ForwardedConnection, RusshConnector, RusshSftp, SshConnection,\\\\n};/' crates/protocols/src/lib.rs)",
+      "Bash(./target/debug/rrs tunnel-remote *)",
+      "Bash(NEXTERM_SSH_PASSWORD=x ./target/debug/rrs tunnel-remote --ssh-host h --ssh-user u --remote-bind nope --local-target 127.0.0.1:8080)"
     ]
   }
 }

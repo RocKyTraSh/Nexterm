@@ -42,6 +42,7 @@ use russh::keys::agent::client::AgentClient;
 use russh::keys::{load_secret_key, ssh_key, PrivateKeyWithHashAlg};
 use russh::{Channel, ChannelMsg, ChannelStream, Disconnect};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 use rrs_core::model::{AuthMethod, ConnectionProfile, ProtocolSettings, SshSettings};
 
@@ -125,29 +126,75 @@ pub fn plan_auth(methods: &[AuthMethod], has_password: bool, has_key: bool) -> V
 // Connection handler
 // ---------------------------------------------------------------------------
 
-/// russh client handler: its only job is host-key verification.
+/// An incoming `forwarded-tcpip` connection (remote forwarding, `ssh -R`): the
+/// server accepted a connection on the remote bind and opened this channel back
+/// to us. The tunnel driver connects to the local target and pumps bytes over
+/// [`stream`](Self::stream).
+pub struct ForwardedConnection {
+    /// The remote bind address the server is listening on (`connected-address`).
+    pub connected_address: String,
+    /// The remote bind port (`connected-port`).
+    pub connected_port: u16,
+    /// The peer that connected to the remote bind (`originator-address`).
+    pub originator_address: String,
+    pub originator_port: u16,
+    /// The byte stream of the forwarded channel.
+    pub stream: DirectTcpipStream,
+}
+
+/// russh client handler: verifies the host key and (for `ssh -R`) routes
+/// incoming `forwarded-tcpip` channels to the tunnel driver.
 struct ClientHandler {
     host: String,
     port: u16,
     strict: bool,
     /// Set to one of the `HK_*` constants from `check_server_key`.
     hostkey_status: Arc<AtomicU8>,
+    /// Sink for incoming `forwarded-tcpip` channels (remote forwarding). The
+    /// receiver lives in the owning [`SshConnection`].
+    forwarded_tx: mpsc::UnboundedSender<ForwardedConnection>,
 }
 
 impl ClientHandler {
-    /// Build a host-key-verifying handler from SSH settings.
-    fn new(ssh: &SshSettings) -> Self {
+    /// Build a handler from SSH settings, wired to `forwarded_tx` for incoming
+    /// remote-forward channels.
+    fn new(ssh: &SshSettings, forwarded_tx: mpsc::UnboundedSender<ForwardedConnection>) -> Self {
         Self {
             host: ssh.host.clone(),
             port: ssh.port,
             strict: ssh.strict_host_key_checking,
             hostkey_status: Arc::new(AtomicU8::new(HK_PENDING)),
+            forwarded_tx,
         }
     }
 }
 
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
+
+    /// Called by russh when the server opens a `forwarded-tcpip` channel (a
+    /// connection arrived on a remote bind we requested via `tcpip-forward`).
+    /// We hand the channel's stream + metadata to the tunnel driver; if no
+    /// receiver is listening the send fails and the channel is dropped (closed).
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        let fwd = ForwardedConnection {
+            connected_address: connected_address.to_string(),
+            connected_port: connected_port as u16,
+            originator_address: originator_address.to_string(),
+            originator_port: originator_port as u16,
+            stream: channel.into_stream(),
+        };
+        let _ = self.forwarded_tx.send(fwd);
+        Ok(())
+    }
 
     async fn check_server_key(
         &mut self,
@@ -213,21 +260,29 @@ pub struct SshConnection {
     /// connection's lifetime: the target SSH runs over a `direct-tcpip` channel
     /// of the gateway, so dropping the gateway would tear down the transport.
     _via: Option<Box<SshConnection>>,
+    /// Receiver of incoming `forwarded-tcpip` channels (remote forwarding).
+    /// Taken once by the tunnel driver when it starts a remote forward.
+    forwarded_rx: AsyncMutex<Option<mpsc::UnboundedReceiver<ForwardedConnection>>>,
 }
 
 impl SshConnection {
     /// Connect over a fresh TCP socket, verify the host key, and authenticate.
     pub async fn connect(ssh: &SshSettings, creds: &ResolvedCredentials) -> Result<Self> {
         let config = Arc::new(client::Config::default());
+        let (tx, rx) = mpsc::unbounded_channel();
         let mut handle = client::connect(
             config,
             (ssh.host.clone(), ssh.port),
-            ClientHandler::new(ssh),
+            ClientHandler::new(ssh, tx),
         )
         .await
         .map_err(|e| ProtocolError::Connect(e.to_string()))?;
         authenticate(&mut handle, ssh, creds).await?;
-        Ok(Self { handle, _via: None })
+        Ok(Self {
+            handle,
+            _via: None,
+            forwarded_rx: AsyncMutex::new(Some(rx)),
+        })
     }
 
     /// Run the SSH handshake over an already-established byte stream (e.g. a
@@ -243,13 +298,15 @@ impl SshConnection {
         R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let config = Arc::new(client::Config::default());
-        let mut handle = client::connect_stream(config, stream, ClientHandler::new(ssh))
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut handle = client::connect_stream(config, stream, ClientHandler::new(ssh, tx))
             .await
             .map_err(|e| ProtocolError::Connect(e.to_string()))?;
         authenticate(&mut handle, ssh, creds).await?;
         Ok(Self {
             handle,
             _via: Some(Box::new(via)),
+            forwarded_rx: AsyncMutex::new(Some(rx)),
         })
     }
 
@@ -374,6 +431,43 @@ impl SshConnection {
             .await
             .map_err(|e| ProtocolError::Channel(e.to_string()))?;
         Ok(channel.into_stream())
+    }
+
+    /// Ask the server to listen on `bind_address:bind_port` and forward incoming
+    /// connections back to us as `forwarded-tcpip` channels (remote forwarding,
+    /// `ssh -R`). Returns the port the server actually bound — equal to
+    /// `bind_port`, or a server-chosen port when `bind_port == 0`.
+    ///
+    /// Pair this with [`take_forwarded_connections`](Self::take_forwarded_connections)
+    /// to receive the resulting channels.
+    pub async fn request_remote_forward(&self, bind_address: &str, bind_port: u16) -> Result<u16> {
+        let assigned = self
+            .handle
+            .tcpip_forward(bind_address.to_string(), bind_port as u32)
+            .await
+            .map_err(|e| {
+                ProtocolError::Channel(format!(
+                    "tcpip-forward request for {bind_address}:{bind_port} was denied: {e}"
+                ))
+            })?;
+        Ok(assigned as u16)
+    }
+
+    /// Cancel a previously-requested remote forward (best-effort).
+    pub async fn cancel_remote_forward(&self, bind_address: &str, bind_port: u16) {
+        let _ = self
+            .handle
+            .cancel_tcpip_forward(bind_address.to_string(), bind_port as u32)
+            .await;
+    }
+
+    /// Take the receiver of incoming `forwarded-tcpip` connections. Returns
+    /// `None` if it was already taken (one remote forward consumer per
+    /// connection in this build).
+    pub async fn take_forwarded_connections(
+        &self,
+    ) -> Option<mpsc::UnboundedReceiver<ForwardedConnection>> {
+        self.forwarded_rx.lock().await.take()
     }
 
     /// Send a clean SSH disconnect (best-effort).

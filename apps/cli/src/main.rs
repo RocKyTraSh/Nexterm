@@ -182,6 +182,38 @@ enum Command {
         #[arg(long)]
         insecure: bool,
     },
+    /// Run a remote port-forward (`ssh -R`) over SSH until Ctrl-C
+    /// (needs `--features ssh-russh`).
+    ///
+    /// Asks the SSH server to listen on `--remote-bind` and forwards connections
+    /// it receives back to `--local-target` on this machine. Needs server-side
+    /// `AllowTcpForwarding`; binding `--remote-bind` to a non-loopback address
+    /// also needs `GatewayPorts`. The password comes from an env var (dev-only)
+    /// and is never printed.
+    #[cfg(feature = "ssh-russh")]
+    TunnelRemote {
+        #[arg(long)]
+        ssh_host: String,
+        #[arg(long, default_value_t = 22)]
+        ssh_port: u16,
+        #[arg(long)]
+        ssh_user: String,
+        /// Private key for the SSH connection (publickey auth).
+        #[arg(long)]
+        key: Option<String>,
+        /// Env var holding the SSH password (dev-only).
+        #[arg(long, default_value = "NEXTERM_SSH_PASSWORD")]
+        password_env: String,
+        /// Remote listen address on the SSH server, `host:port` (port 0 = server picks).
+        #[arg(long)]
+        remote_bind: String,
+        /// Local destination on this machine, `host:port` (e.g. 127.0.0.1:8080).
+        #[arg(long)]
+        local_target: String,
+        /// Disable known_hosts checking (accept unknown host keys).
+        #[arg(long)]
+        insecure: bool,
+    },
     /// List a remote directory over SFTP (needs `--features ssh-russh`).
     ///
     /// Dev harness: the password is read from `--password-env` (default
@@ -407,6 +439,29 @@ async fn main() -> anyhow::Result<()> {
                 key,
                 password_env,
                 bind,
+                insecure,
+            )
+            .await
+        }
+        #[cfg(feature = "ssh-russh")]
+        Command::TunnelRemote {
+            ssh_host,
+            ssh_port,
+            ssh_user,
+            key,
+            password_env,
+            remote_bind,
+            local_target,
+            insecure,
+        } => {
+            cmd_tunnel_remote(
+                ssh_host,
+                ssh_port,
+                ssh_user,
+                key,
+                password_env,
+                remote_bind,
+                local_target,
                 insecure,
             )
             .await
@@ -877,6 +932,73 @@ async fn cmd_tunnel_socks(
         .await
         .map_err(|e| anyhow::anyhow!("stopping socks proxy: {e}"))?;
     println!("socks proxy stopped.");
+    Ok(())
+}
+
+#[cfg(feature = "ssh-russh")]
+#[allow(clippy::too_many_arguments)]
+async fn cmd_tunnel_remote(
+    ssh_host: String,
+    ssh_port: u16,
+    ssh_user: String,
+    key: Option<String>,
+    password_env: String,
+    remote_bind: String,
+    local_target: String,
+    insecure: bool,
+) -> anyhow::Result<()> {
+    use rrs_core::model::SshSettings;
+    use rrs_tunnels::{RusshTunnelDriver, TunnelManager, TunnelSpec};
+    use uuid::Uuid;
+
+    let (remote_bind_host, remote_bind_port) =
+        split_host_port(&remote_bind).context("parsing --remote-bind")?;
+    let (local_host, local_port) =
+        split_host_port(&local_target).context("parsing --local-target")?;
+
+    let ssh = SshSettings {
+        host: ssh_host.clone(),
+        port: ssh_port,
+        username: ssh_user.clone(),
+        private_key_path: key,
+        strict_host_key_checking: !insecure,
+        ..SshSettings::default()
+    };
+    let creds = creds_from_env(&password_env);
+
+    println!("establishing SSH connection to {ssh_host}:{ssh_port} ...");
+    let driver = RusshTunnelDriver::connect(&ssh, &creds)
+        .await
+        .map_err(|e| anyhow::anyhow!("ssh connect for tunnel: {e}"))?;
+    let mut mgr = TunnelManager::new(Box::new(driver));
+
+    let spec = TunnelSpec::new_remote(
+        "cli-remote",
+        Uuid::new_v4(),
+        remote_bind_host.clone(),
+        remote_bind_port,
+        local_host.clone(),
+        local_port,
+    );
+    let id = mgr.add(spec);
+    mgr.start(id)
+        .await
+        .map_err(|e| anyhow::anyhow!("starting remote forward: {e}"))?;
+
+    println!("remote forward running:");
+    println!("  ssh          : {ssh_user}@{ssh_host}:{ssh_port}");
+    println!("  remote bind  : {remote_bind_host}:{remote_bind_port}  (on the SSH server)");
+    println!("  local target : {local_host}:{local_port}  (on this machine)");
+    println!("  (needs server AllowTcpForwarding; non-loopback bind needs GatewayPorts)");
+    println!("Press Ctrl-C to stop.");
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for ctrl-c")?;
+
+    mgr.stop(id)
+        .await
+        .map_err(|e| anyhow::anyhow!("stopping remote forward: {e}"))?;
+    println!("remote forward stopped.");
     Ok(())
 }
 

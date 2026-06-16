@@ -18,4 +18,4 @@ pub use traits::{
 pub use local::{LocalPtySession, LocalShellConnector};
 
 #[cfg(feature = "ssh-russh")]
-pub use ssh::{DirectTcpipStream, RusshConnector, RusshSftp, SshConnection};
+pub use ssh::{DirectTcpipStream, ForwardedConnection, RusshConnector, RusshSftp, SshConnection};

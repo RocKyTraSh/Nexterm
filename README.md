@@ -28,11 +28,12 @@ SSH/Telnet/RDP/VNC/SFTP и т.д., менеджер туннелей, мульт
   SSH/SFTP через `russh`** (флаг `ssh-russh`): PTY-shell, auth agent→key→
   password→keyboard-interactive, проверка `known_hosts`.
 - Менеджер SSH-туннелей (local/remote/dynamic) с mock-драйвером и тестами,
-  плюс **реальный драйвер через `russh`** (флаг `ssh-russh`): **local-forwarding
-  (`ssh -L`)** и **dynamic SOCKS5 (`ssh -D`)** — `direct-tcpip`-канал на каждое
-  входящее соединение, bidirectional-прокачка байт, корректный shutdown по
-  `stop`/Ctrl-C. SOCKS5: только NO AUTH + CONNECT (без UDP/BIND/SOCKS4). Remote
-  (`-R`) пока возвращает `Unsupported`.
+  плюс **реальный драйвер через `russh`** (флаг `ssh-russh`) для **всех трёх
+  видов форвардинга**: **local (`ssh -L`)**, **dynamic SOCKS5 (`ssh -D`)** и
+  **remote (`ssh -R`)**. Bidirectional-прокачка байт, корректный shutdown по
+  `stop`/Ctrl-C. `-L`/`-D` — `direct-tcpip`-канал на исходящее соединение; `-R` —
+  серверный `tcpip-forward` + входящие `forwarded-tcpip` каналы обратно к
+  клиенту. SOCKS5: только NO AUTH + CONNECT (без UDP/BIND/SOCKS4).
 - **Multi-hop jump-host (`ProxyJump`) chains** для **shell и SFTP**: подключение
   к target через цепочку gateway'ев `gateway1 → gateway2 → … → target` по
   вложенным `direct-tcpip` каналам — реальная SSH-сессия на каждом хопе, не
@@ -170,6 +171,17 @@ cargo run -p rrs-cli --features ssh-russh -- tunnel-socks \
 curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
 curl --socks5-hostname 127.0.0.1:1080 https://example.com
 
+# Remote port-forward (ssh -R) до Ctrl-C (нужна фича ssh-russh):
+#   1. На локальной машине поднимите target-сервис, например:
+#        python -m http.server 8080 --bind 127.0.0.1
+#   2. Запросите у SSH-сервера слушать 127.0.0.1:18080 и форвардить к target:
+NEXTERM_SSH_PASSWORD='secret' \
+cargo run -p rrs-cli --features ssh-russh -- tunnel-remote \
+  --ssh-host SERVER --ssh-user USER \
+  --remote-bind 127.0.0.1:18080 --local-target 127.0.0.1:8080
+#   3. НА SSH-СЕРВЕРЕ: curl http://127.0.0.1:18080  → ответит локальный python.
+# Нужен server-side AllowTcpForwarding; bind на 0.0.0.0 требует GatewayPorts.
+
 # SFTP: листинг каталога (нужна фича ssh-russh). Пароль — из env (dev-only):
 NEXTERM_SSH_PASSWORD='secret' \
 cargo run -p rrs-cli --features ssh-russh -- sftp-ls \
@@ -220,11 +232,11 @@ cargo test --workspace
   (крипто-бэкенд `ring`). Готово: PTY-shell как `RemoteSession`, SFTP
   (`RusshSftp`), аутентификация agent→key→password→keyboard-interactive,
   проверка `known_hosts` с учётом `strict_host_key_checking`, **multi-hop
-  jump-host chains (`direct-tcpip`)** и **реальный tunnel driver
-  (local-forwarding `-L` + dynamic SOCKS5 `-D`)**. Внутри — единый
+  jump-host chains (`direct-tcpip`)** и **реальный tunnel driver (все три вида:
+  local `-L` + dynamic SOCKS5 `-D` + remote `-R`)**. Внутри — единый
   переиспользуемый примитив `SshConnection` (connect / connect через цепочку
-  jump / `open_shell` / `open_sftp` / `open_forward_stream`), без копипасты
-  auth/known_hosts.
+  jump / `open_shell` / `open_sftp` / `open_forward_stream` /
+  `request_remote_forward`), без копипасты auth/known_hosts.
   - Auth methods реально готовы: **agent, public key, password,
     keyboard-interactive**. Strict mode: неизвестный host-key → отказ;
     non-strict → подключение + warning; изменённый ключ → всегда отказ.
@@ -251,33 +263,43 @@ cargo test --workspace
   - **SFTP** (`sftp-ls`, `sftp-jump-ls`, `sftp-chain-ls`): `RusshSftp::connect`
     (direct) и `RusshSftp::connect_via_jump` / `connect_via_jump_chain` поверх
     того же `SshConnection` — auth/known_hosts не дублируются.
-  - **Tunnel driver**: `RusshTunnelDriver` биндит локальный listener и форвардит
-    каждое соединение через `direct-tcpip`.
-    - **Local (`-L`)** (`tunnel-local`): фиксированный `target:port` из спека.
-    - **Dynamic SOCKS5 (`-D`)** (`tunnel-socks`): на каждое соединение —
-      SOCKS5-хендшейк, target берётся из CONNECT-запроса. Поддержано: SOCKS5,
+  - **Tunnel driver** (`RusshTunnelDriver`). Отличие трёх видов:
+    - **Local (`-L`)** (`tunnel-local`): локальный listener → `direct-tcpip` →
+      фиксированный remote `target:port` из спека.
+    - **Dynamic SOCKS5 (`-D`)** (`tunnel-socks`): локальный SOCKS-listener →
+      `direct-tcpip` → target из CONNECT-запроса. Поддержано: SOCKS5,
       `NO AUTH` (`0x00`), `CONNECT` (`0x01`), адреса IPv4/domain/IPv6. НЕ
       поддержано: SOCKS4/4a, username/password auth, `UDP ASSOCIATE`, `BIND`.
       SOCKS-парсер (`crates/tunnels/src/socks5.rs`) — чистые функции под
       юнит-тестами, в default-сборке (без `russh`). SOCKS success-reply шлётся
       только после успешного открытия `direct-tcpip`; на ошибки — корректный
       failure-reply.
-    - Remote (`-R`) → `TunnelError::Unsupported`.
+    - **Remote (`-R`)** (`tunnel-remote`): через `tcpip-forward` сервер слушает
+      `--remote-bind` и открывает обратно к клиенту `forwarded-tcpip` каналы; на
+      каждый канал Nexterm подключается к `--local-target` (на машине клиента) и
+      прокачивает байты. Входящие каналы доставляются через handler соединения
+      (`ForwardedConnection`). Remote bind port `0` поддержан (сервер выбирает
+      порт, он логируется). На `stop`/Ctrl-C — `cancel-tcpip-forward`. Одно
+      SSH-соединение держит **один** активный `-R` (receiver берётся один раз).
+      Ограничения: нужен server-side `AllowTcpForwarding`; bind на non-loopback
+      требует `GatewayPorts`; bind на привилегированный порт может требовать root
+      на сервере. Через jump-chain `-R` пока не делается.
     Драйвер живёт в `crates/tunnels` (фича `ssh-russh`, dep `rrs-protocols`);
     граф остаётся однонаправленным `tunnels → protocols → core`.
   - Все dev CLI-команды (`ssh-connect`, `ssh-jump-connect`, `ssh-chain-connect`,
-    `tunnel-local`, `tunnel-socks`, `sftp-ls`, `sftp-jump-ls`, `sftp-chain-ls`)
-    читают пароли из env — это **временный dev-харнесс**, не финальный UX: в
-    проде секрет лежит в OS-keyring и резолвится транзиентно.
-  - Live-проверки `direct-tcpip` помечены `#[ignore]` и требуют sshd:
+    `tunnel-local`, `tunnel-socks`, `tunnel-remote`, `sftp-ls`, `sftp-jump-ls`,
+    `sftp-chain-ls`) читают пароли из env — это **временный dev-харнесс**, не
+    финальный UX: в проде секрет лежит в OS-keyring и резолвится транзиентно.
+  - Live-проверки помечены `#[ignore]` и требуют sshd:
     `jump_host_roundtrip`, `sftp_jump_roundtrip`, `jump_chain_roundtrip`,
     `sftp_jump_chain_roundtrip` (`rrs-protocols`; single-hop — env
     `NEXTERM_JUMP_TEST_*` + `NEXTERM_TARGET_TEST_*`; chain — `NEXTERM_CHAIN_JUMP1_*`,
     `NEXTERM_CHAIN_JUMP2_*`, `NEXTERM_CHAIN_TARGET_*` + `NEXTERM_CHAIN_TARGET_SFTP_PATH`),
-    `local_tunnel_roundtrip` и `dynamic_socks_roundtrip` (`rrs-tunnels`, env
-    `NEXTERM_SSH_TEST_*`; для curl-проверки SOCKS — `NEXTERM_SOCKS_TEST_URL`),
-    плюс `sftp_roundtrip` (direct).
-  - Ещё не сделано: remote (`-R`) форвардинг; проброс SSH-агента.
+    `local_tunnel_roundtrip`, `dynamic_socks_roundtrip` и `remote_tunnel_roundtrip`
+    (`rrs-tunnels`, env `NEXTERM_SSH_TEST_*`; для `-R` ещё `NEXTERM_REMOTE_TEST_BIND`;
+    для curl-проверки SOCKS — `NEXTERM_SOCKS_TEST_URL`), плюс `sftp_roundtrip`
+    (direct).
+  - Ещё не сделано: проброс SSH-агента; remote (`-R`) через jump-chain.
 - `pty` — локальный shell через PTY (`portable-pty`), в крейте `rrs-terminal`.
 - `local-pty` (на `rrs-cli`/`rrs-protocols`) — local-shell как полноценный транспорт
   через `AppCore::connect` (`LocalShellConnector`/`LocalPtySession`); тянет `pty`.
@@ -318,11 +340,11 @@ RUST_LOG=rrs_miniservers=debug,info cargo run -p rrs-cli -- serve-http
 ## Дорожная карта
 - **v0.2:** реальный SSH+SFTP через `russh` ✓; реальный PTY ✓; multi-hop
   jump-host chains для shell и SFTP ✓; оркестрация jump-host chains в `AppCore`
-  ✓; tunnel driver — local-forwarding (`-L`) ✓ и dynamic SOCKS5 (`-D`) ✓;
+  ✓; tunnel driver — local (`-L`) ✓, dynamic SOCKS5 (`-D`) ✓ и remote (`-R`) ✓;
   SQLite-хранилище с миграциями; Qt/QML-скелет (одно окно + вкладка поверх
   `AppCore`).
 - **v0.3:** полноценная SGR-aware подсветка; вендорные пресеты (Cisco/MikroTik/
-  …); **remote (`-R`) туннели**; проброс SSH-агента; больше мини-серверов
+  …); проброс SSH-агента; tunnel-менеджмент в GUI; больше мини-серверов
   (TFTP/FTP/SSH); GTK-фронтенд.
 - **Долгосрочно:** RDP (IronRDP) и VNC; обёртки X-сервера (Xephyr/Xvfb/Xwayland,
   без переписывания Xorg); серверы NFS/Telnet/VNC; интеграция с systemd

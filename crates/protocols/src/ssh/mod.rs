@@ -12,4 +12,6 @@ pub mod russh_impl;
 pub use mock::{MockConnector, MockSftp};
 
 #[cfg(feature = "ssh-russh")]
-pub use russh_impl::{DirectTcpipStream, RusshConnector, RusshSession, RusshSftp, SshConnection};
+pub use russh_impl::{
+    DirectTcpipStream, ForwardedConnection, RusshConnector, RusshSession, RusshSftp, SshConnection,
+};

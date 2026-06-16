@@ -90,6 +90,30 @@ impl TunnelSpec {
         }
     }
 
+    /// Helper to build a remote (`-R`) forward. `bind_*` is the **remote** listen
+    /// endpoint on the SSH server; `target_*` is the **local** destination on the
+    /// machine running Nexterm.
+    pub fn new_remote(
+        name: impl Into<String>,
+        ssh_profile_id: Uuid,
+        remote_bind_address: impl Into<String>,
+        remote_bind_port: u16,
+        local_target_host: impl Into<String>,
+        local_target_port: u16,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            kind: TunnelKind::Remote,
+            ssh_profile_id,
+            bind_address: remote_bind_address.into(),
+            bind_port: remote_bind_port,
+            target_host: Some(local_target_host.into()),
+            target_port: Some(local_target_port),
+            autostart: false,
+        }
+    }
+
     /// The `(address, port)` this tunnel binds locally. Errors on an empty
     /// address. Pure — no socket is opened (unit-tested).
     pub fn bind_endpoint(&self) -> Result<(String, u16)> {
@@ -117,6 +141,36 @@ impl TunnelSpec {
             TunnelError::InvalidSpec("local forward requires a target port".into())
         })?;
         Ok((host, port))
+    }
+
+    /// For a **remote** (`-R`) forward: `((remote_bind_host, remote_bind_port),
+    /// (local_target_host, local_target_port))`. Pure (unit-tested).
+    ///
+    /// The remote bind port may be `0` (the server picks a port); the local
+    /// target host must be non-empty and its port non-zero.
+    pub fn remote_forward_endpoints(&self) -> Result<((String, u16), (String, u16))> {
+        if self.kind != TunnelKind::Remote {
+            return Err(TunnelError::Unsupported(format!("{:?}", self.kind)));
+        }
+        if self.bind_address.trim().is_empty() {
+            return Err(TunnelError::InvalidSpec(
+                "remote forward requires a remote bind address".into(),
+            ));
+        }
+        let local_host = self
+            .target_host
+            .clone()
+            .filter(|h| !h.trim().is_empty())
+            .ok_or_else(|| {
+                TunnelError::InvalidSpec("remote forward requires a local target host".into())
+            })?;
+        let local_port = self.target_port.filter(|p| *p != 0).ok_or_else(|| {
+            TunnelError::InvalidSpec("remote forward requires a non-zero local target port".into())
+        })?;
+        Ok((
+            (self.bind_address.clone(), self.bind_port),
+            (local_host, local_port),
+        ))
     }
 }
 
@@ -346,5 +400,75 @@ mod tests {
         let mut mgr2 = TunnelManager::new(Box::new(MockTunnelDriver));
         mgr2.import_specs(&json).unwrap();
         assert_eq!(mgr2.list()[0].0.kind, TunnelKind::Dynamic);
+    }
+
+    #[test]
+    fn remote_forward_endpoints_validation() {
+        // bind_* is the REMOTE listen endpoint; target_* is the LOCAL target.
+        let spec =
+            TunnelSpec::new_remote("r", Uuid::new_v4(), "127.0.0.1", 18080, "127.0.0.1", 8080);
+        assert_eq!(spec.kind, TunnelKind::Remote);
+        assert_eq!(
+            spec.remote_forward_endpoints().unwrap(),
+            (
+                ("127.0.0.1".to_string(), 18080),
+                ("127.0.0.1".to_string(), 8080)
+            )
+        );
+
+        // Remote bind port 0 is allowed (the server assigns one).
+        let mut zero_bind = spec.clone();
+        zero_bind.bind_port = 0;
+        assert_eq!(
+            zero_bind.remote_forward_endpoints().unwrap().0,
+            ("127.0.0.1".to_string(), 0)
+        );
+
+        // Empty remote bind host → InvalidSpec.
+        let mut bad_bind = spec.clone();
+        bad_bind.bind_address = "  ".into();
+        assert!(matches!(
+            bad_bind.remote_forward_endpoints(),
+            Err(TunnelError::InvalidSpec(_))
+        ));
+
+        // Missing / empty local target host → InvalidSpec.
+        let mut no_target = spec.clone();
+        no_target.target_host = None;
+        assert!(matches!(
+            no_target.remote_forward_endpoints(),
+            Err(TunnelError::InvalidSpec(_))
+        ));
+
+        // Zero local target port → InvalidSpec (can't connect to port 0).
+        let mut zero_target = spec.clone();
+        zero_target.target_port = Some(0);
+        assert!(matches!(
+            zero_target.remote_forward_endpoints(),
+            Err(TunnelError::InvalidSpec(_))
+        ));
+
+        // Calling it on a non-remote spec is Unsupported.
+        let local = TunnelSpec::new_local("l", Uuid::new_v4(), 8080, "x", 1);
+        assert!(matches!(
+            local.remote_forward_endpoints(),
+            Err(TunnelError::Unsupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_spec_is_accepted_by_manager() {
+        let spec =
+            TunnelSpec::new_remote("r", Uuid::new_v4(), "127.0.0.1", 18080, "127.0.0.1", 8080);
+        let mut mgr = TunnelManager::new(Box::new(MockTunnelDriver));
+        let id = mgr.add(spec);
+        mgr.start(id).await.unwrap();
+        assert_eq!(mgr.status(id), Some(TunnelStatus::Running));
+        mgr.stop(id).await.unwrap();
+
+        let json = mgr.export_specs().unwrap();
+        let mut mgr2 = TunnelManager::new(Box::new(MockTunnelDriver));
+        mgr2.import_specs(&json).unwrap();
+        assert_eq!(mgr2.list()[0].0.kind, TunnelKind::Remote);
     }
 }
