@@ -1,0 +1,33 @@
+[package]
+name = "rrs-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rrs"
+path = "src/main.rs"
+
+[features]
+default = []
+# Forward optional backends so a single CLI binary can exercise them.
+keyring-os = ["rrs-credentials/keyring-os"]
+ssh-russh = ["rrs-protocols/ssh-russh"]
+pty = ["rrs-terminal/pty"]
+# PTY-backed local-shell transport reachable through AppCore::connect.
+local-pty = ["rrs-protocols/local-pty"]
+
+[dependencies]
+rrs-core = { workspace = true }
+rrs-credentials = { workspace = true }
+rrs-protocols = { workspace = true }
+rrs-terminal = { workspace = true }
+rrs-miniservers = { workspace = true }
+rrs-platform = { workspace = true }
+rrs-ui-common = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+uuid = { workspace = true }

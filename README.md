@@ -1,0 +1,182 @@
+# rust-remote-suite
+
+Linux-first набор для удалённого доступа и администрирования — концептуальный
+аналог MobaXterm / mRemoteNG, написанный на Rust. Цель проекта: единое окно с
+вкладками для SSH/Telnet/RDP/VNC/SFTP и т.д., менеджер туннелей, мульти-ввод,
+встроенные мини-серверы и безопасное хранение секретов.
+
+> **Статус: ранний MVP-скелет.** Это инженерно-корректная отправная точка, а не
+> готовый продукт. Готов каркас workspace, доменные модели, абстракции
+> протоколов и хранения секретов, рабочий HTTP мини-сервер, планировщик и
+> CLI-харнесс с тестами. GUI (Qt) и реальный SSH (`russh`) идут следующими
+> итерациями. Подробности — в разделе «Дорожная карта».
+
+## Что уже работает
+- Многокрейтовый Cargo workspace с чётким графом зависимостей.
+- Доменные модели (профили, группы, сессии), конфиг (TOML), event bus.
+- Хранение профилей в JSON-файле за трейтом `ProfileStore` (без секретов).
+- Абстракция секретов: тип `Secret` (zero-on-drop, без `Display`/`Serialize`),
+  трейт `CredentialStore`, in-memory backend по умолчанию и backend OS-keyring
+  под флагом `keyring-os`.
+- Трейтовая модель транспортов (`Connector`/`RemoteSession`/`SftpClient`) с
+  рабочим mock-SSH и каркасом `russh` под флагом `ssh-russh`.
+- Менеджер SSH-туннелей (local/remote/dynamic) с mock-драйвером и тестами.
+- Рабочий HTTP-файловый мини-сервер (axum) и планировщик-мини-сервер.
+- Логика, не зависящая от GUI: мульти-ввод с защитой от опасных команд, макросы
+  с предупреждением о секретах, детектор конфликтов при правке удалённых файлов,
+  модель подсветки вывода с защитой от порчи TUI (alt-screen).
+- CLI-харнесс `rrs` и юнит-тесты по ключевым крейтам.
+
+## Архитектура (кратко)
+```
+apps/cli      -> бинарь `rrs` (харнесс)
+apps/qt       -> Qt-фронтенд (заготовка; см. apps/qt/README.md)
+apps/gtk      -> GTK-фронтенд (заготовка)
+
+crates/ui-common  -> AppCore (фасад) + мульти-ввод/макросы/конфликты/safety
+crates/core       -> модели, конфиг, события, реестр сессий, ProfileStore
+crates/credentials-> Secret + CredentialStore (memory / OS keyring)
+crates/protocols  -> Connector/RemoteSession/SftpClient (+ SSH mock/russh)
+crates/terminal   -> подсветка, alt-screen, PTY (feature `pty`)
+crates/tunnels    -> модель и менеджер SSH-туннелей
+crates/miniservers-> framework мини-серверов + HTTP + scheduler
+crates/platform   -> пути/идентичность ОС (Linux-first)
+xtask             -> запуск задач (build/test/fmt/lint)
+```
+Принцип: фронтенды держат `Arc<AppCore>` и ничего не знают о транспортах и
+хранилищах. Новый протокол = новая реализация трейта, без правок UI.
+
+## Требования
+- Rust (stable). Код 2024-ready, но в скелете зафиксирован edition 2021 для
+  предсказуемой первой сборки (см. комментарий в корневом `Cargo.toml`).
+- Системные библиотеки только для отдельных feature-флагов и будущего GUI (ниже).
+
+### Системные зависимости
+
+**Arch Linux / KDE Plasma (целевая среда)**
+```bash
+sudo pacman -S --needed base-devel pkgconf openssl cmake
+# OS-keyring в рантайме на KDE предоставляет KWallet (обычно уже есть).
+# Вне KDE можно поставить gnome-keyring:
+# sudo pacman -S --needed gnome-keyring
+# Будущий Qt-фронтенд:
+sudo pacman -S --needed qt6-base qt6-declarative
+# Будущий GTK-фронтенд:
+sudo pacman -S --needed gtk4
+```
+
+**Ubuntu / Debian**
+```bash
+sudo apt update
+sudo apt install -y build-essential pkg-config libssl-dev cmake
+# Будущий Qt: qt6-base-dev qt6-declarative-dev
+# Будущий GTK: libgtk-4-dev
+```
+
+**Fedora**
+```bash
+sudo dnf install -y @development-tools pkgconf-pkg-config openssl-devel cmake
+# Будущий Qt: qt6-qtbase-devel qt6-qtdeclarative-devel
+# Будущий GTK: gtk4-devel
+```
+
+### Установка Rust
+```bash
+# Рекомендуется rustup:
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup default stable
+# Либо дистрибутивный пакет (Arch): sudo pacman -S rust
+```
+
+## Сборка и запуск
+```bash
+cd rust-remote-suite
+
+# Debug-сборка всего workspace (фичи по умолчанию: mock-SSH, in-memory секреты,
+# HTTP-сервер). Тянет только широко используемые крейты.
+cargo build
+
+# Release:
+cargo build --release
+
+# Базовая проверка окружения:
+cargo run -p rrs-cli -- check
+
+# HTTP-файловый сервер (loopback по умолчанию):
+cargo run -p rrs-cli -- serve-http --root . --port 8080
+
+# Демо mock-SSH (без сети):
+cargo run -p rrs-cli -- ssh-demo
+
+# Локальный shell через PTY поверх AppCore (нужна фича local-pty):
+cargo run -p rrs-cli --features local-pty -- local-shell --command "echo hi"
+
+# Подсветка строки вывода:
+cargo run -p rrs-cli -- highlight "iface eth0 is up at 10.0.0.1 error"
+
+# Проверка команды детектором опасных шаблонов (мульти-ввод):
+cargo run -p rrs-cli -- danger-check "sudo rm -rf /"
+
+# Профили (JSON-хранилище):
+cargo run -p rrs-cli -- profiles add-ssh myhost 10.0.0.1 --user admin
+cargo run -p rrs-cli -- profiles list
+
+# Все тесты:
+cargo test --workspace
+```
+
+### Feature-флаги
+- `keyring-os` — backend OS-keyring (Secret Service / KWallet / GNOME Keyring).
+  Пример: `cargo run -p rrs-cli --features keyring-os -- check`.
+- `ssh-russh` — реальный SSH через `russh` (пока каркас, возвращает
+  NotImplemented). При включении компилируется модуль интеграции.
+- `pty` — локальный shell через PTY (`portable-pty`), в крейте `rrs-terminal`.
+- `local-pty` (на `rrs-cli`/`rrs-protocols`) — local-shell как полноценный транспорт
+  через `AppCore::connect` (`LocalShellConnector`/`LocalPtySession`); тянет `pty`.
+  Пример: `cargo run -p rrs-cli --features local-pty -- local-shell`.
+
+Запуск вспомогательных задач:
+```bash
+cargo run -p xtask -- build      # | build-release | test | fmt | lint | run-cli
+```
+
+## Безопасность секретов
+- Профили и группы **никогда** не содержат паролей/ключей — только `CredentialRef`
+  (UUID + нcaption-метка). Сам секрет лежит в OS-keyring (с `keyring-os`) или
+  только в памяти (по умолчанию) и зануляется при удалении (`zeroize`).
+- Тип `Secret` не реализует `Display`/`Serialize`, а его `Debug` печатает
+  `Secret(***)`, чтобы секреты не утекали в логи/файлы.
+- Блокирующие вызовы keyring выполняются на blocking-пуле, не на UI-потоке.
+
+## Логи
+Через `RUST_LOG` (по умолчанию `info`):
+```bash
+RUST_LOG=debug cargo run -p rrs-cli -- ssh-demo
+RUST_LOG=rrs_miniservers=debug,info cargo run -p rrs-cli -- serve-http
+```
+
+## Решение проблем
+- `cannot find -lssl` / ошибки линковки — поставьте OpenSSL dev и pkg-config
+  (`openssl`/`libssl-dev`/`openssl-devel` + `pkgconf`/`pkg-config`).
+- `pkg-config not found` — установите `pkgconf` (Arch) / `pkg-config`.
+- keyring в рантайме ругается на отсутствие Secret Service — на KDE запущен
+  KWallet, вне KDE поставьте `gnome-keyring`; нужна активная сессия D-Bus.
+- сборка с `ssh-russh` требует C-компилятора и `cmake` (крипто-зависимости).
+- если конкретная версия axum не примет `Router` в `axum::serve` — замените
+  `app` на `app.into_make_service()` в `crates/miniservers/src/http.rs`
+  (или закрепите `axum = "0.7"`, API для этого использования совпадает).
+- будущий Qt-фронтенд требует Qt6 + CMake/qmake.
+
+## Дорожная карта
+- **v0.2:** реальный SSH+SFTP через `russh`; реальный PTY; SQLite-хранилище с
+  миграциями; Qt/QML-скелет (одно окно + вкладка поверх `AppCore`); реальное
+  форвардинг туннелей через каналы `russh`.
+- **v0.3:** полноценная SGR-aware подсветка; вендорные пресеты (Cisco/MikroTik/
+  …); цепочки jump-host; больше мини-серверов (TFTP/FTP/SSH); GTK-фронтенд.
+- **Долгосрочно:** RDP (IronRDP) и VNC; обёртки X-сервера (Xephyr/Xvfb/Xwayland,
+  без переписывания Xorg); серверы NFS/Telnet/VNC; интеграция с systemd
+  (user-services); поддержка Windows (backend Windows Credential Manager за тем
+  же трейтом `CredentialStore`); проброс агента SSH.
+
+## Лицензия
+MIT OR Apache-2.0.

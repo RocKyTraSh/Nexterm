@@ -1,0 +1,20 @@
+[package]
+name = "rrs-ui-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rrs-core = { workspace = true }
+rrs-credentials = { workspace = true }
+rrs-protocols = { workspace = true }
+rrs-tunnels = { workspace = true }
+rrs-miniservers = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }

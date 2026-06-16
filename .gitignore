@@ -1,0 +1,17 @@
+/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+
+# OS/editor trash
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# local env/secrets
+.env
+.env.*
+!.env.example

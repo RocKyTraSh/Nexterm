@@ -1,0 +1,17 @@
+[package]
+name = "rrs-terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Local-shell PTY backend via `portable-pty` (from the WezTerm project).
+pty = ["dep:portable-pty"]
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+portable-pty = { version = "0.8", optional = true }

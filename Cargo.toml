@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/credentials",
+    "crates/protocols",
+    "crates/terminal",
+    "crates/tunnels",
+    "crates/miniservers",
+    "crates/platform",
+    "crates/ui-common",
+    "apps/cli",
+    "apps/qt",
+    "apps/gtk",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+# NOTE: edition 2024 is stable and this code is 2024-clean. We start on 2021 to
+# de-risk the very first build; bump this single line to "2024" once it is green.
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["rust-remote-suite contributors"]
+repository = "https://example.org/rust-remote-suite"
+
+[workspace.dependencies]
+# --- async runtime ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "fs", "io-util", "signal"] }
+# --- errors ---
+thiserror = "1"
+anyhow = "1"
+# --- tracing / logging ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# --- serialization ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# --- misc ---
+uuid = { version = "1", features = ["v4", "serde"] }
+async-trait = "0.1"
+regex = "1"
+zeroize = { version = "1", features = ["derive"] }
+# --- cli ---
+clap = { version = "4", features = ["derive"] }
+# --- platform paths ---
+dirs = "5"
+# --- http mini-server ---
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs"] }
+
+# --- internal crates ---
+rrs-core = { path = "crates/core", version = "0.1.0" }
+rrs-credentials = { path = "crates/credentials", version = "0.1.0" }
+rrs-protocols = { path = "crates/protocols", version = "0.1.0" }
+rrs-terminal = { path = "crates/terminal", version = "0.1.0" }
+rrs-tunnels = { path = "crates/tunnels", version = "0.1.0" }
+rrs-miniservers = { path = "crates/miniservers", version = "0.1.0" }
+rrs-platform = { path = "crates/platform", version = "0.1.0" }
+rrs-ui-common = { path = "crates/ui-common", version = "0.1.0" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,26 @@
+[package]
+name = "rrs-protocols"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Real SSH transport via the `russh` crate. The implementation module is a
+# documented scaffold today; enabling this feature compiles it (it returns a
+# NotImplemented error until the russh integration lands). Add the russh /
+# russh-sftp dependencies when implementing — pin and verify the API first.
+ssh-russh = []
+# Local-shell transport: adapts the terminal crate's PTY backend (feature `pty`)
+# to the async `RemoteSession` trait so a local shell is just another transport.
+# OFF by default (pulls in `portable-pty`); enable to use `LocalShellConnector`.
+local-pty = ["dep:rrs-terminal", "rrs-terminal/pty"]
+
+[dependencies]
+rrs-core = { workspace = true }
+rrs-credentials = { workspace = true }
+rrs-terminal = { workspace = true, optional = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

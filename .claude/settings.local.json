@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo --version)",
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo run *)",
+      "Bash(cargo fmt *)",
+      "Bash(grep -B1 -A3 \"this \\\\`impl\\\\` can be derived\")"
+    ]
+  }
+}

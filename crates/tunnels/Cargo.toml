@@ -1,0 +1,15 @@
+[package]
+name = "rrs-tunnels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rrs-core = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
