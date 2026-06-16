@@ -38,7 +38,10 @@
       "Bash(./target/debug/rrs sftp-ls *)",
       "Bash(echo \"default tree russh count \\(0=good\\): $\\(cargo tree --no-default-features)",
       "Bash(./target/debug/rrs ssh-chain-connect *)",
-      "Bash(NEXTERM_TARGET_PASSWORD=x ./target/debug/rrs ssh-chain-connect --jump gw1 --target t:u)"
+      "Bash(NEXTERM_TARGET_PASSWORD=x ./target/debug/rrs ssh-chain-connect --jump gw1 --target t:u)",
+      "Bash(echo \"default build: $\\(cargo build --workspace 2>&1)",
+      "Bash(./target/debug/rrs tunnel-socks *)",
+      "Bash(NEXTERM_SSH_PASSWORD=x ./target/debug/rrs tunnel-socks --ssh-host 127.0.0.1 --ssh-user u --bind nope)"
     ]
   }
 }

@@ -69,6 +69,27 @@ impl TunnelSpec {
         }
     }
 
+    /// Helper to build a dynamic SOCKS (`-D`) proxy. No fixed target — the
+    /// destination comes from each SOCKS request.
+    pub fn new_dynamic(
+        name: impl Into<String>,
+        ssh_profile_id: Uuid,
+        bind_address: impl Into<String>,
+        bind_port: u16,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            kind: TunnelKind::Dynamic,
+            ssh_profile_id,
+            bind_address: bind_address.into(),
+            bind_port,
+            target_host: None,
+            target_port: None,
+            autostart: false,
+        }
+    }
+
     /// The `(address, port)` this tunnel binds locally. Errors on an empty
     /// address. Pure — no socket is opened (unit-tested).
     pub fn bind_endpoint(&self) -> Result<(String, u16)> {
@@ -303,5 +324,27 @@ mod tests {
             spec.bind_endpoint(),
             Err(TunnelError::InvalidSpec(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn dynamic_spec_is_accepted_by_manager() {
+        let spec = TunnelSpec::new_dynamic("socks", Uuid::new_v4(), "127.0.0.1", 1080);
+        assert_eq!(spec.kind, TunnelKind::Dynamic);
+        assert_eq!(spec.target_host, None);
+        // A dynamic proxy still has a bind endpoint but no fixed target.
+        assert_eq!(spec.bind_endpoint().unwrap(), ("127.0.0.1".into(), 1080));
+
+        // The manager (with the mock driver) drives a dynamic spec like any other.
+        let mut mgr = TunnelManager::new(Box::new(MockTunnelDriver));
+        let id = mgr.add(spec);
+        mgr.start(id).await.unwrap();
+        assert_eq!(mgr.status(id), Some(TunnelStatus::Running));
+        mgr.stop(id).await.unwrap();
+
+        // Specs round-trip through JSON (secret-free).
+        let json = mgr.export_specs().unwrap();
+        let mut mgr2 = TunnelManager::new(Box::new(MockTunnelDriver));
+        mgr2.import_specs(&json).unwrap();
+        assert_eq!(mgr2.list()[0].0.kind, TunnelKind::Dynamic);
     }
 }

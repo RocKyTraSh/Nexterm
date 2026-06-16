@@ -155,6 +155,33 @@ enum Command {
         #[arg(long)]
         insecure: bool,
     },
+    /// Run a dynamic SOCKS5 proxy (`ssh -D`) over SSH until Ctrl-C
+    /// (needs `--features ssh-russh`).
+    ///
+    /// Binds a local SOCKS5 listener; each CONNECT request is forwarded through a
+    /// `direct-tcpip` channel on the SSH connection. SOCKS5 / NO AUTH / CONNECT
+    /// only. The password comes from an env var (dev-only) and is never printed.
+    #[cfg(feature = "ssh-russh")]
+    TunnelSocks {
+        #[arg(long)]
+        ssh_host: String,
+        #[arg(long, default_value_t = 22)]
+        ssh_port: u16,
+        #[arg(long)]
+        ssh_user: String,
+        /// Private key for the SSH connection (publickey auth).
+        #[arg(long)]
+        key: Option<String>,
+        /// Env var holding the SSH password (dev-only).
+        #[arg(long, default_value = "NEXTERM_SSH_PASSWORD")]
+        password_env: String,
+        /// Local address to bind the SOCKS5 proxy, `host:port` (e.g. 127.0.0.1:1080).
+        #[arg(long)]
+        bind: String,
+        /// Disable known_hosts checking (accept unknown host keys).
+        #[arg(long)]
+        insecure: bool,
+    },
     /// List a remote directory over SFTP (needs `--features ssh-russh`).
     ///
     /// Dev harness: the password is read from `--password-env` (default
@@ -359,6 +386,27 @@ async fn main() -> anyhow::Result<()> {
                 password_env,
                 bind,
                 target,
+                insecure,
+            )
+            .await
+        }
+        #[cfg(feature = "ssh-russh")]
+        Command::TunnelSocks {
+            ssh_host,
+            ssh_port,
+            ssh_user,
+            key,
+            password_env,
+            bind,
+            insecure,
+        } => {
+            cmd_tunnel_socks(
+                ssh_host,
+                ssh_port,
+                ssh_user,
+                key,
+                password_env,
+                bind,
                 insecure,
             )
             .await
@@ -773,6 +821,62 @@ async fn cmd_tunnel_local(
         .await
         .map_err(|e| anyhow::anyhow!("stopping tunnel: {e}"))?;
     println!("tunnel stopped.");
+    Ok(())
+}
+
+#[cfg(feature = "ssh-russh")]
+#[allow(clippy::too_many_arguments)]
+async fn cmd_tunnel_socks(
+    ssh_host: String,
+    ssh_port: u16,
+    ssh_user: String,
+    key: Option<String>,
+    password_env: String,
+    bind: String,
+    insecure: bool,
+) -> anyhow::Result<()> {
+    use rrs_core::model::SshSettings;
+    use rrs_tunnels::{RusshTunnelDriver, TunnelManager, TunnelSpec};
+    use uuid::Uuid;
+
+    let (bind_addr, bind_port) = split_host_port(&bind).context("parsing --bind")?;
+
+    let ssh = SshSettings {
+        host: ssh_host.clone(),
+        port: ssh_port,
+        username: ssh_user.clone(),
+        private_key_path: key,
+        strict_host_key_checking: !insecure,
+        ..SshSettings::default()
+    };
+    let creds = creds_from_env(&password_env);
+
+    println!("establishing SSH connection to {ssh_host}:{ssh_port} ...");
+    let driver = RusshTunnelDriver::connect(&ssh, &creds)
+        .await
+        .map_err(|e| anyhow::anyhow!("ssh connect for tunnel: {e}"))?;
+    let mut mgr = TunnelManager::new(Box::new(driver));
+
+    let spec = TunnelSpec::new_dynamic("cli-socks", Uuid::new_v4(), bind_addr.clone(), bind_port);
+    let id = mgr.add(spec);
+    mgr.start(id)
+        .await
+        .map_err(|e| anyhow::anyhow!("starting socks proxy: {e}"))?;
+
+    println!("dynamic SOCKS5 proxy running:");
+    println!("  bind   : {bind_addr}:{bind_port}");
+    println!("  ssh    : {ssh_user}@{ssh_host}:{ssh_port}");
+    println!("  (SOCKS5, NO AUTH, CONNECT only)");
+    println!("Try: curl --socks5-hostname {bind_addr}:{bind_port} https://example.com");
+    println!("Press Ctrl-C to stop.");
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for ctrl-c")?;
+
+    mgr.stop(id)
+        .await
+        .map_err(|e| anyhow::anyhow!("stopping socks proxy: {e}"))?;
+    println!("socks proxy stopped.");
     Ok(())
 }
 

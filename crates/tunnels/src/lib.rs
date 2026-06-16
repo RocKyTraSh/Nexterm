@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod manager;
+pub mod socks5;
 
 #[cfg(feature = "ssh-russh")]
 pub mod russh_driver;

@@ -1,12 +1,14 @@
 //! Real port-forwarding driver over an SSH session (feature `ssh-russh`).
 //!
-//! Implements local forwarding (`ssh -L`): bind a local TCP listener and, for
-//! every accepted connection, open a `direct-tcpip` channel on a shared SSH
-//! connection and pump bytes both ways with [`tokio::io::copy_bidirectional`].
+//! Binds a local TCP listener and, for every accepted connection, opens a
+//! `direct-tcpip` channel on a shared SSH connection and pumps bytes both ways
+//! with [`tokio::io::copy_bidirectional`]. The destination depends on the kind:
+//! * **Local** (`ssh -L`): a fixed `host:port` from the spec;
+//! * **Dynamic** (`ssh -D`): a SOCKS5 proxy — each connection negotiates its own
+//!   destination (see [`crate::socks5`]).
 //!
 //! Scope (minimal, by design):
-//! * **Local** forwarding only. Remote (`-R`) and dynamic SOCKS (`-D`) return
-//!   [`TunnelError::Unsupported`] with a clear message.
+//! * Remote (`-R`) returns [`TunnelError::Unsupported`].
 //! * One driver holds **one** SSH connection and forwards every spec over it;
 //!   the spec's `ssh_profile_id` is not re-resolved here (that belongs to the
 //!   orchestration layer). Construct one driver per SSH endpoint.
@@ -33,9 +35,34 @@ use rrs_core::model::SshSettings;
 use rrs_protocols::{ResolvedCredentials, SshConnection};
 
 use crate::error::{Result, TunnelError};
-use crate::manager::{TunnelDriver, TunnelSpec};
+use crate::manager::{TunnelDriver, TunnelKind, TunnelSpec};
+use crate::socks5;
 
-/// Bookkeeping for one running local forward.
+/// What a tunnel's accepted connections should do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ForwardMode {
+    /// `-L`: every connection forwards to a fixed `host:port`.
+    Local { host: String, port: u16 },
+    /// `-D`: every connection is a SOCKS5 request choosing its own destination.
+    Dynamic,
+}
+
+/// Decide the forwarding mode for a spec (pure; unit-tested). Remote (`-R`) is
+/// not implemented yet.
+fn forward_mode_for(spec: &TunnelSpec) -> Result<ForwardMode> {
+    match spec.kind {
+        TunnelKind::Local => {
+            let (host, port) = spec.local_forward_target()?;
+            Ok(ForwardMode::Local { host, port })
+        }
+        TunnelKind::Dynamic => Ok(ForwardMode::Dynamic),
+        TunnelKind::Remote => Err(TunnelError::Unsupported(
+            "remote forwarding (ssh -R)".into(),
+        )),
+    }
+}
+
+/// Bookkeeping for one running tunnel.
 struct RunningTunnel {
     /// Send `()` (or drop) to ask the accept loop and all forwards to stop.
     shutdown: broadcast::Sender<()>,
@@ -76,8 +103,8 @@ impl RusshTunnelDriver {
 impl TunnelDriver for RusshTunnelDriver {
     async fn start(&self, spec: &TunnelSpec) -> Result<()> {
         let (bind_addr, bind_port) = spec.bind_endpoint()?;
-        // Errors for non-Local kinds and for missing target fields.
-        let (target_host, target_port) = spec.local_forward_target()?;
+        // Errors for Remote (`-R`) and for a Local spec missing its target.
+        let mode = forward_mode_for(spec)?;
 
         let listener = TcpListener::bind((bind_addr.as_str(), bind_port))
             .await
@@ -87,20 +114,22 @@ impl TunnelDriver for RusshTunnelDriver {
         let local = listener
             .local_addr()
             .map_err(|e| TunnelError::Driver(e.to_string()))?;
-        tracing::info!(
-            tunnel = %spec.id,
-            name = %spec.name,
-            bind = %local,
-            target = %format!("{target_host}:{target_port}"),
-            "local forward started"
-        );
+        match &mode {
+            ForwardMode::Local { host, port } => tracing::info!(
+                tunnel = %spec.id, name = %spec.name, bind = %local,
+                target = %format!("{host}:{port}"), "local forward started"
+            ),
+            ForwardMode::Dynamic => tracing::info!(
+                tunnel = %spec.id, name = %spec.name, bind = %local,
+                "dynamic SOCKS proxy started"
+            ),
+        }
 
         let (shutdown, _) = broadcast::channel::<()>(1);
         let accept_task = tokio::spawn(accept_loop(
             listener,
             self.conn.clone(),
-            target_host,
-            target_port,
+            mode,
             shutdown.clone(),
             spec.id,
         ));
@@ -126,7 +155,7 @@ impl TunnelDriver for RusshTunnelDriver {
             let _ = rt.shutdown.send(());
             rt.accept_task.abort();
             let _ = rt.accept_task.await;
-            tracing::info!(tunnel = %id, "local forward stopped");
+            tracing::info!(tunnel = %id, "forward stopped");
         }
         Ok(())
     }
@@ -148,8 +177,7 @@ impl Drop for RusshTunnelDriver {
 async fn accept_loop(
     listener: TcpListener,
     conn: Arc<SshConnection>,
-    target_host: String,
-    target_port: u16,
+    mode: ForwardMode,
     shutdown: broadcast::Sender<()>,
     id: Uuid,
 ) {
@@ -159,11 +187,10 @@ async fn accept_loop(
             _ = shutdown_rx.recv() => break,
             accept = listener.accept() => match accept {
                 Ok((sock, peer)) => {
-                    tokio::spawn(forward_conn(
+                    tokio::spawn(handle_conn(
                         conn.clone(),
                         sock,
-                        target_host.clone(),
-                        target_port,
+                        mode.clone(),
                         shutdown.subscribe(),
                         id,
                         peer,
@@ -178,9 +205,43 @@ async fn accept_loop(
     }
 }
 
-/// Pump one accepted connection over a fresh `direct-tcpip` channel until either
-/// side closes or the tunnel is stopped.
-async fn forward_conn(
+/// Dispatch one accepted connection to the right forwarder.
+async fn handle_conn(
+    conn: Arc<SshConnection>,
+    sock: TcpStream,
+    mode: ForwardMode,
+    shutdown_rx: broadcast::Receiver<()>,
+    id: Uuid,
+    peer: SocketAddr,
+) {
+    match mode {
+        ForwardMode::Local { host, port } => {
+            forward_local(conn, sock, host, port, shutdown_rx, id, peer).await
+        }
+        ForwardMode::Dynamic => forward_dynamic(conn, sock, shutdown_rx, id, peer).await,
+    }
+}
+
+/// Copy bytes between `sock` and an open forward `stream` until either side
+/// closes or the tunnel is stopped.
+async fn pump_until_stop(
+    sock: &mut TcpStream,
+    stream: &mut rrs_protocols::DirectTcpipStream,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+    id: Uuid,
+    peer: SocketAddr,
+) {
+    tokio::select! {
+        res = copy_bidirectional(sock, stream) => match res {
+            Ok((up, down)) => tracing::debug!(tunnel = %id, %peer, up, down, "forward closed"),
+            Err(e) => tracing::debug!(tunnel = %id, %peer, "forward error: {e}"),
+        },
+        _ = shutdown_rx.recv() => tracing::debug!(tunnel = %id, %peer, "forward cancelled by stop"),
+    }
+}
+
+/// Local (`-L`) forward: a fixed destination opened immediately.
+async fn forward_local(
     conn: Arc<SshConnection>,
     mut sock: TcpStream,
     host: String,
@@ -196,19 +257,46 @@ async fn forward_conn(
             return;
         }
     };
-    tokio::select! {
-        res = copy_bidirectional(&mut sock, &mut stream) => match res {
-            Ok((up, down)) => {
-                tracing::debug!(tunnel = %id, %peer, up, down, "forward closed");
-            }
-            Err(e) => {
-                tracing::debug!(tunnel = %id, %peer, "forward error: {e}");
-            }
-        },
-        _ = shutdown_rx.recv() => {
-            tracing::debug!(tunnel = %id, %peer, "forward cancelled by stop");
-        }
+    pump_until_stop(&mut sock, &mut stream, &mut shutdown_rx, id, peer).await;
+}
+
+/// Dynamic (`-D`) forward: negotiate a SOCKS5 CONNECT, then forward to the
+/// requested destination. The SOCKS success reply is sent only after the
+/// `direct-tcpip` channel opens; failures send the matching SOCKS reply.
+async fn forward_dynamic(
+    conn: Arc<SshConnection>,
+    mut sock: TcpStream,
+    mut shutdown_rx: broadcast::Receiver<()>,
+    id: Uuid,
+    peer: SocketAddr,
+) {
+    if let Err(e) = socks5::negotiate_method(&mut sock).await {
+        tracing::debug!(tunnel = %id, %peer, "socks5 method negotiation failed: {e}");
+        return;
     }
+    let req = match socks5::read_request(&mut sock).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = socks5::write_reply(&mut sock, e.reply_code()).await;
+            tracing::debug!(tunnel = %id, %peer, "socks5 request rejected: {e}");
+            return;
+        }
+    };
+
+    let (host, port) = (req.host(), req.port);
+    let mut stream = match conn.open_forward_stream(&host, port).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = socks5::write_reply(&mut sock, socks5::ReplyCode::HostUnreachable).await;
+            tracing::debug!(tunnel = %id, %peer, "socks5 direct-tcpip to {host}:{port} failed: {e}");
+            return;
+        }
+    };
+    if let Err(e) = socks5::write_reply(&mut sock, socks5::ReplyCode::Succeeded).await {
+        tracing::debug!(tunnel = %id, %peer, "socks5 success reply failed: {e}");
+        return;
+    }
+    pump_until_stop(&mut sock, &mut stream, &mut shutdown_rx, id, peer).await;
 }
 
 #[cfg(test)]
@@ -216,6 +304,39 @@ mod tests {
     use super::*;
     use crate::manager::TunnelManager;
     use rrs_core::model::SshSettings;
+
+    #[test]
+    fn forward_mode_dispatch() {
+        let profile = Uuid::new_v4();
+
+        let local = TunnelSpec::new_local("l", profile, 8080, "10.0.0.5", 80);
+        assert_eq!(
+            forward_mode_for(&local).unwrap(),
+            ForwardMode::Local {
+                host: "10.0.0.5".into(),
+                port: 80
+            }
+        );
+
+        let dynamic = TunnelSpec::new_dynamic("d", profile, "127.0.0.1", 1080);
+        assert_eq!(forward_mode_for(&dynamic).unwrap(), ForwardMode::Dynamic);
+
+        // Remote (`-R`) is not implemented yet.
+        let mut remote = TunnelSpec::new_local("r", profile, 8080, "x", 1);
+        remote.kind = TunnelKind::Remote;
+        assert!(matches!(
+            forward_mode_for(&remote),
+            Err(TunnelError::Unsupported(_))
+        ));
+
+        // A Local spec missing its target is rejected before any socket opens.
+        let mut bad_local = TunnelSpec::new_local("b", profile, 8080, "x", 1);
+        bad_local.target_host = None;
+        assert!(matches!(
+            forward_mode_for(&bad_local),
+            Err(TunnelError::InvalidSpec(_))
+        ));
+    }
 
     /// Live local-forward round-trip against a real sshd. Ignored by default
     /// (needs a server). It forwards a local port to the sshd's *own* listener
@@ -279,5 +400,81 @@ mod tests {
         );
 
         mgr.stop(id).await.expect("stop tunnel");
+    }
+
+    /// Live dynamic-SOCKS round-trip against a real sshd. Ignored by default
+    /// (needs a server with outbound network). Starts a SOCKS5 proxy over SSH,
+    /// then drives the in-process SOCKS5 handshake against the sshd's own
+    /// listener (`127.0.0.1:<ssh port>`) and checks the SSH banner comes back —
+    /// proving the proxy forwards bytes end-to-end. Run e.g.:
+    ///
+    /// ```text
+    /// NEXTERM_SSH_TEST_HOST=127.0.0.1 \
+    /// NEXTERM_SSH_TEST_USER=$USER \
+    /// NEXTERM_SSH_TEST_KEY=$HOME/.ssh/id_ed25519 \
+    /// cargo test -p rrs-tunnels --features ssh-russh -- --ignored dynamic_socks_roundtrip
+    /// ```
+    ///
+    /// `NEXTERM_SOCKS_TEST_URL` is honored by the manual `curl` recipe in the
+    /// README; this in-process test does not need it.
+    #[tokio::test]
+    #[ignore = "requires a reachable sshd; see doc comment"]
+    async fn dynamic_socks_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let host = std::env::var("NEXTERM_SSH_TEST_HOST").expect("NEXTERM_SSH_TEST_HOST");
+        let user = std::env::var("NEXTERM_SSH_TEST_USER").expect("NEXTERM_SSH_TEST_USER");
+        let key = std::env::var("NEXTERM_SSH_TEST_KEY").expect("NEXTERM_SSH_TEST_KEY");
+        let ssh_port: u16 = std::env::var("NEXTERM_SSH_TEST_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(22);
+
+        let ssh = SshSettings {
+            host,
+            port: ssh_port,
+            username: user,
+            private_key_path: Some(key),
+            strict_host_key_checking: false,
+            ..SshSettings::default()
+        };
+        let driver = RusshTunnelDriver::connect(&ssh, &ResolvedCredentials::default())
+            .await
+            .expect("ssh connect");
+        let mut mgr = TunnelManager::new(Box::new(driver));
+
+        let mut spec = TunnelSpec::new_dynamic("socks", Uuid::new_v4(), "127.0.0.1", 0);
+        spec.bind_port = 11080;
+        let id = mgr.add(spec);
+        mgr.start(id).await.expect("start socks");
+
+        // SOCKS5 handshake to the proxy, asking it to CONNECT to the sshd itself.
+        let mut s = TcpStream::connect(("127.0.0.1", 11080u16))
+            .await
+            .expect("connect to socks bind");
+        // Greeting: VER=5, 1 method, NO_AUTH.
+        s.write_all(&[0x05, 0x01, 0x00]).await.expect("greeting");
+        let mut method = [0u8; 2];
+        s.read_exact(&mut method).await.expect("method reply");
+        assert_eq!(method, [0x05, 0x00]);
+        // CONNECT 127.0.0.1:<ssh_port>.
+        let mut req = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+        req.extend_from_slice(&ssh_port.to_be_bytes());
+        s.write_all(&req).await.expect("connect request");
+        let mut reply = [0u8; 10];
+        s.read_exact(&mut reply).await.expect("connect reply");
+        assert_eq!(reply[1], 0x00, "expected SOCKS success reply");
+
+        // Now the stream is the sshd connection — read its banner.
+        let mut buf = [0u8; 16];
+        let n = s.read(&mut buf).await.expect("read banner via socks");
+        assert!(
+            buf[..n].starts_with(b"SSH-"),
+            "expected an SSH banner through the SOCKS proxy, got {:?}",
+            &buf[..n]
+        );
+
+        mgr.stop(id).await.expect("stop socks");
     }
 }
