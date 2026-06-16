@@ -12,11 +12,25 @@ use crate::model::SessionState;
 /// Events emitted by core subsystems.
 #[derive(Debug, Clone)]
 pub enum AppEvent {
-    SessionStateChanged { session_id: Uuid, state: SessionState },
-    SessionClosed { session_id: Uuid },
-    TunnelStatusChanged { tunnel_id: Uuid, status: String },
-    MiniServerStateChanged { server_id: Uuid, running: bool },
-    Log { level: LogLevel, message: String },
+    SessionStateChanged {
+        session_id: Uuid,
+        state: SessionState,
+    },
+    SessionClosed {
+        session_id: Uuid,
+    },
+    TunnelStatusChanged {
+        tunnel_id: Uuid,
+        status: String,
+    },
+    MiniServerStateChanged {
+        server_id: Uuid,
+        running: bool,
+    },
+    Log {
+        level: LogLevel,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

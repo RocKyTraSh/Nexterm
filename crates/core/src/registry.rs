@@ -18,7 +18,10 @@ pub struct SessionRegistry {
 
 impl SessionRegistry {
     pub fn new(bus: EventBus) -> Self {
-        Self { inner: Arc::new(RwLock::new(HashMap::new())), bus }
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+            bus,
+        }
     }
 
     pub async fn register(&self, session: RuntimeSession) -> Uuid {
@@ -30,7 +33,10 @@ impl SessionRegistry {
     pub async fn set_state(&self, id: Uuid, state: SessionState) {
         if let Some(s) = self.inner.write().await.get_mut(&id) {
             s.state = state.clone();
-            self.bus.publish(AppEvent::SessionStateChanged { session_id: id, state });
+            self.bus.publish(AppEvent::SessionStateChanged {
+                session_id: id,
+                state,
+            });
         }
     }
 

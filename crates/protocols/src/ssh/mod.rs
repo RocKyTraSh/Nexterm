@@ -9,3 +9,6 @@ pub mod mock;
 pub mod russh_impl;
 
 pub use mock::{MockConnector, MockSftp};
+
+#[cfg(feature = "ssh-russh")]
+pub use russh_impl::{RusshConnector, RusshSession, RusshSftp};

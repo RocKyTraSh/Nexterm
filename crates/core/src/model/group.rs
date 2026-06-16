@@ -12,6 +12,10 @@ pub struct Group {
 
 impl Group {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { id: Uuid::new_v4(), name: name.into(), parent_id: None }
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            parent_id: None,
+        }
     }
 }

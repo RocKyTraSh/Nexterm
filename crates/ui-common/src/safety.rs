@@ -19,11 +19,20 @@ fn danger_patterns() -> &'static [(&'static str, &'static str)] {
         (r"(?i)\brm\s+-[a-z]*r[a-z]*f", "recursive force delete"),
         (r"(?i)\bmkfs\b", "filesystem format"),
         (r"(?i)\bdd\b\s+if=", "raw disk write"),
-        (r"(?i)\b(reboot|shutdown|poweroff|halt)\b", "power state change"),
-        (r"(?i)\bsystemctl\s+(restart|stop|disable)\b", "service disruption"),
+        (
+            r"(?i)\b(reboot|shutdown|poweroff|halt)\b",
+            "power state change",
+        ),
+        (
+            r"(?i)\bsystemctl\s+(restart|stop|disable)\b",
+            "service disruption",
+        ),
         (r":\(\)\s*\{.*\};\s*:", "fork bomb"),
         (r"(?i)>\s*/dev/sd", "write to block device"),
-        (r"(?i)\bchmod\s+-R\s+777\b", "world-writable recursive chmod"),
+        (
+            r"(?i)\bchmod\s+-R\s+777\b",
+            "world-writable recursive chmod",
+        ),
     ]
 }
 
@@ -44,7 +53,10 @@ pub fn scan_dangerous(command: &str) -> Vec<DangerWarning> {
         .iter()
         .filter(|(re, _)| re.is_match(command))
         .map(|(re, reason)| DangerWarning {
-            matched: re.find(command).map(|m| m.as_str().to_string()).unwrap_or_default(),
+            matched: re
+                .find(command)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default(),
             reason: (*reason).to_string(),
         })
         .collect()

@@ -32,7 +32,12 @@ pub struct SchedulerServer {
 
 impl SchedulerServer {
     pub fn new(config: MiniServerConfig, tasks: Vec<ScheduledTask>) -> Self {
-        Self { config, state: ServerState::Stopped, tasks, handles: Arc::new(Mutex::new(Vec::new())) }
+        Self {
+            config,
+            state: ServerState::Stopped,
+            tasks,
+            handles: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 }
 

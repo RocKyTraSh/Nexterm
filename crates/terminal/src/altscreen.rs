@@ -38,7 +38,9 @@ impl AltScreenTracker {
                 let mut num = 0u32;
                 let mut have_digit = false;
                 while j < bytes.len() && bytes[j].is_ascii_digit() {
-                    num = num.saturating_mul(10).saturating_add((bytes[j] - b'0') as u32);
+                    num = num
+                        .saturating_mul(10)
+                        .saturating_add((bytes[j] - b'0') as u32);
                     have_digit = true;
                     j += 1;
                 }

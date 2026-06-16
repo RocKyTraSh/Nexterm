@@ -67,9 +67,14 @@ impl LineHighlighter {
     pub fn from_profile(profile: &HighlightProfile) -> Result<Self> {
         let mut rules = Vec::new();
         for r in profile.rules.iter().filter(|r| r.enabled) {
-            let regex = Regex::new(&r.pattern)
-                .map_err(|source| TerminalError::BadRegex { name: r.name.clone(), source })?;
-            rules.push(CompiledRule { style: r.style, regex });
+            let regex = Regex::new(&r.pattern).map_err(|source| TerminalError::BadRegex {
+                name: r.name.clone(),
+                source,
+            })?;
+            rules.push(CompiledRule {
+                style: r.style,
+                regex,
+            });
         }
         Ok(Self { rules })
     }
@@ -83,7 +88,11 @@ impl LineHighlighter {
         let mut spans: Vec<HighlightSpan> = Vec::new();
         for rule in &self.rules {
             for m in rule.regex.find_iter(line) {
-                let candidate = HighlightSpan { start: m.start(), end: m.end(), style: rule.style };
+                let candidate = HighlightSpan {
+                    start: m.start(),
+                    end: m.end(),
+                    style: rule.style,
+                };
                 if !spans.iter().any(|s| overlaps(s, &candidate)) {
                     spans.push(candidate);
                 }

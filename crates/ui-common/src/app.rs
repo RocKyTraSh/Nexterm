@@ -87,7 +87,9 @@ impl AppCore {
         connector: Arc<dyn Connector>,
     ) -> anyhow::Result<Self> {
         let config_path = AppConfig::default_path();
-        let config = AppConfig::load_or_default(&config_path).await.context("loading config")?;
+        let config = AppConfig::load_or_default(&config_path)
+            .await
+            .context("loading config")?;
         let profiles = Arc::new(FileProfileStore::default_store());
         Ok(Self::new(config, profiles, credentials, connector))
     }
@@ -138,7 +140,9 @@ impl AppCore {
                 Ok((id, transport))
             }
             Err(e) => {
-                self.sessions.set_state(id, SessionState::Failed(e.to_string())).await;
+                self.sessions
+                    .set_state(id, SessionState::Failed(e.to_string()))
+                    .await;
                 Err(anyhow::anyhow!("connect failed: {e}"))
             }
         }

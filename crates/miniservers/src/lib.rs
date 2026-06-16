@@ -10,6 +10,4 @@ pub mod service;
 pub use error::{MiniServerError, Result};
 pub use http::HttpFileServer;
 pub use scheduler::{ScheduledTask, SchedulerServer};
-pub use service::{
-    MiniServer, MiniServerConfig, MiniServerKind, MiniServerManager, ServerState,
-};
+pub use service::{MiniServer, MiniServerConfig, MiniServerKind, MiniServerManager, ServerState};

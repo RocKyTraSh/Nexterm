@@ -114,14 +114,25 @@ impl MiniServerManager {
     }
 
     pub async fn start(&mut self, id: Uuid) -> Result<()> {
-        self.servers.get_mut(&id).ok_or(MiniServerError::NotFound(id))?.start().await
+        self.servers
+            .get_mut(&id)
+            .ok_or(MiniServerError::NotFound(id))?
+            .start()
+            .await
     }
 
     pub async fn stop(&mut self, id: Uuid) -> Result<()> {
-        self.servers.get_mut(&id).ok_or(MiniServerError::NotFound(id))?.stop().await
+        self.servers
+            .get_mut(&id)
+            .ok_or(MiniServerError::NotFound(id))?
+            .stop()
+            .await
     }
 
     pub fn list(&self) -> Vec<(MiniServerConfig, ServerState)> {
-        self.servers.values().map(|s| (s.config().clone(), s.state())).collect()
+        self.servers
+            .values()
+            .map(|s| (s.config().clone(), s.state()))
+            .collect()
     }
 }

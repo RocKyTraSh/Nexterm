@@ -9,9 +9,10 @@ pub mod traits;
 pub mod local;
 
 pub use error::{ProtocolError, Result};
-pub use traits::{
-    Connector, DirEntry, EntryKind, RemoteSession, ResolvedCredentials, SftpClient,
-};
+pub use traits::{Connector, DirEntry, EntryKind, RemoteSession, ResolvedCredentials, SftpClient};
 
 #[cfg(feature = "local-pty")]
 pub use local::{LocalPtySession, LocalShellConnector};
+
+#[cfg(feature = "ssh-russh")]
+pub use ssh::{RusshConnector, RusshSftp};

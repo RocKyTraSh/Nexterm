@@ -93,7 +93,10 @@ pub struct TunnelManager {
 
 impl TunnelManager {
     pub fn new(driver: Box<dyn TunnelDriver>) -> Self {
-        Self { driver, tunnels: HashMap::new() }
+        Self {
+            driver,
+            tunnels: HashMap::new(),
+        }
     }
 
     /// Register a spec (initially stopped). Returns its id.
@@ -161,7 +164,10 @@ impl TunnelManager {
     /// Import specs from JSON, replacing the current set (all stopped).
     pub fn import_specs(&mut self, json: &str) -> Result<()> {
         let specs: Vec<TunnelSpec> = serde_json::from_str(json)?;
-        self.tunnels = specs.into_iter().map(|s| (s.id, (s, TunnelStatus::Stopped))).collect();
+        self.tunnels = specs
+            .into_iter()
+            .map(|s| (s.id, (s, TunnelStatus::Stopped)))
+            .collect();
         Ok(())
     }
 }
@@ -187,7 +193,13 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_with_mock_driver() {
         let mut mgr = TunnelManager::new(Box::new(MockTunnelDriver));
-        let id = mgr.add(TunnelSpec::new_local("web", Uuid::new_v4(), 8080, "10.0.0.5", 80));
+        let id = mgr.add(TunnelSpec::new_local(
+            "web",
+            Uuid::new_v4(),
+            8080,
+            "10.0.0.5",
+            80,
+        ));
         assert_eq!(mgr.status(id), Some(TunnelStatus::Stopped));
         mgr.start(id).await.unwrap();
         assert_eq!(mgr.status(id), Some(TunnelStatus::Running));

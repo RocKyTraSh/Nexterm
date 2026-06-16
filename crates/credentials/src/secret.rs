@@ -12,7 +12,9 @@ pub struct Secret {
 
 impl Secret {
     pub fn new(value: impl Into<String>) -> Self {
-        Self { value: value.into() }
+        Self {
+            value: value.into(),
+        }
     }
 
     /// Borrow the secret. Callers must not log or persist the result.

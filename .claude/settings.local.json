@@ -7,7 +7,27 @@
       "Bash(cargo clippy *)",
       "Bash(cargo run *)",
       "Bash(cargo fmt *)",
-      "Bash(grep -B1 -A3 \"this \\\\`impl\\\\` can be derived\")"
+      "Bash(grep -B1 -A3 \"this \\\\`impl\\\\` can be derived\")",
+      "Read(//tmp/**)",
+      "Bash(cargo search *)",
+      "Bash(rm -rf russhprobe)",
+      "Bash(cargo new *)",
+      "Bash(cargo add *)",
+      "Bash(cargo fetch *)",
+      "Bash(set -e)",
+      "Bash(cp ~/.ssh/id_ed25519.pub /tmp/nx_test_pub)",
+      "Bash(chmod 600 ~/.ssh/authorized_keys)",
+      "Bash(./target/debug/rrs ssh-connect *)",
+      "Bash(cp ~/.ssh/known_hosts /tmp/nx_known_hosts.bak)",
+      "Bash(ssh-keyscan -t ed25519 -p 22 127.0.0.1)",
+      "Bash(NEXTERM_SSH_TEST_HOST=127.0.0.1 NEXTERM_SSH_TEST_USER=rockytrash NEXTERM_SSH_TEST_KEY=/home/rockytrash/.ssh/id_ed25519 cargo test -p rrs-protocols --features ssh-russh -- --ignored sftp_roundtrip)",
+      "Bash(NEXTERM_SSH_TEST_HOST=127.0.0.1 NEXTERM_SSH_TEST_USER=rockytrash NEXTERM_SSH_TEST_KEY=/home/rockytrash/.ssh/id_ed25519 cargo test -p rrs-protocols --features ssh-russh -- --ignored sftp_roundtrip --nocapture)",
+      "Bash(rm -f ~/.ssh/authorized_keys)",
+      "Bash(cp /tmp/nx_known_hosts.bak ~/.ssh/known_hosts)",
+      "Bash(rm -f /tmp/nx_known_hosts.bak)",
+      "Bash(rm -f /tmp/nx_test_pub)",
+      "Bash(git init *)",
+      "Bash(git add *)"
     ]
   }
 }

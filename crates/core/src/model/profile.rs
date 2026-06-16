@@ -16,7 +16,10 @@ pub struct CredentialRef {
 
 impl CredentialRef {
     pub fn new(label: impl Into<String>) -> Self {
-        Self { id: Uuid::new_v4(), label: label.into() }
+        Self {
+            id: Uuid::new_v4(),
+            label: label.into(),
+        }
     }
 }
 
@@ -76,7 +79,11 @@ impl Default for SshSettings {
             host: String::new(),
             port: 22,
             username: String::new(),
-            auth_methods: vec![AuthMethod::Agent, AuthMethod::PublicKey, AuthMethod::Password],
+            auth_methods: vec![
+                AuthMethod::Agent,
+                AuthMethod::PublicKey,
+                AuthMethod::Password,
+            ],
             private_key_path: None,
             jump_host: None,
             strict_host_key_checking: true,

@@ -30,7 +30,11 @@ pub struct Macro {
 
 impl Macro {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { id: Uuid::new_v4(), name: name.into(), steps: Vec::new() }
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            steps: Vec::new(),
+        }
     }
 
     /// Indices of steps whose input looks like a secret. The UI should warn
@@ -49,7 +53,9 @@ impl Macro {
 
 impl From<Duration> for MacroStep {
     fn from(d: Duration) -> Self {
-        MacroStep::Delay { millis: d.as_millis() as u64 }
+        MacroStep::Delay {
+            millis: d.as_millis() as u64,
+        }
     }
 }
 
@@ -60,7 +66,9 @@ mod tests {
     #[test]
     fn flags_secret_step() {
         let mut m = Macro::new("login");
-        m.steps.push(MacroStep::Input { text: "whoami\n".into() });
+        m.steps.push(MacroStep::Input {
+            text: "whoami\n".into(),
+        });
         m.steps.push(MacroStep::Input {
             text: "export TOKEN=ghp_abcdefghijklmnopqrstuvwxyz123\n".into(),
         });

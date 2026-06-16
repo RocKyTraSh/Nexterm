@@ -26,7 +26,12 @@ impl LocalPty {
     pub fn spawn(program: Option<&str>, cols: u16, rows: u16) -> Result<(Self, Receiver<Vec<u8>>)> {
         let pty_system = native_pty_system();
         let pair = pty_system
-            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .map_err(|e| TerminalError::Pty(e.to_string()))?;
 
         let shell = program
@@ -67,7 +72,13 @@ impl LocalPty {
             }
         });
 
-        Ok((Self { master: pair.master, writer }, rx))
+        Ok((
+            Self {
+                master: pair.master,
+                writer,
+            },
+            rx,
+        ))
     }
 
     /// Write bytes to the shell's stdin.
@@ -80,7 +91,12 @@ impl LocalPty {
     /// Resize the PTY.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         self.master
-            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .map_err(|e| TerminalError::Pty(e.to_string()))
     }
 }

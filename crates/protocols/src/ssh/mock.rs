@@ -30,7 +30,9 @@ impl Connector for MockConnector {
             profile.name,
             profile.kind()
         );
-        Ok(Box::new(MockSession { pending: VecDeque::from([banner.into_bytes()]) }))
+        Ok(Box::new(MockSession {
+            pending: VecDeque::from([banner.into_bytes()]),
+        }))
     }
 }
 
@@ -71,9 +73,27 @@ impl SftpClient for MockSftp {
     async fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>> {
         if path == "/" || path.is_empty() {
             Ok(vec![
-                DirEntry { name: "etc".into(), kind: EntryKind::Dir, size: 4096, permissions: Some(0o755), modified_unix: None },
-                DirEntry { name: "home".into(), kind: EntryKind::Dir, size: 4096, permissions: Some(0o755), modified_unix: None },
-                DirEntry { name: "readme.txt".into(), kind: EntryKind::File, size: 12, permissions: Some(0o644), modified_unix: None },
+                DirEntry {
+                    name: "etc".into(),
+                    kind: EntryKind::Dir,
+                    size: 4096,
+                    permissions: Some(0o755),
+                    modified_unix: None,
+                },
+                DirEntry {
+                    name: "home".into(),
+                    kind: EntryKind::Dir,
+                    size: 4096,
+                    permissions: Some(0o755),
+                    modified_unix: None,
+                },
+                DirEntry {
+                    name: "readme.txt".into(),
+                    kind: EntryKind::File,
+                    size: 12,
+                    permissions: Some(0o644),
+                    modified_unix: None,
+                },
             ])
         } else {
             Ok(vec![])

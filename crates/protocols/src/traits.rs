@@ -24,7 +24,10 @@ impl std::fmt::Debug for ResolvedCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResolvedCredentials")
             .field("password", &self.password.as_ref().map(|_| "***"))
-            .field("key_passphrase", &self.key_passphrase.as_ref().map(|_| "***"))
+            .field(
+                "key_passphrase",
+                &self.key_passphrase.as_ref().map(|_| "***"),
+            )
             .finish()
     }
 }

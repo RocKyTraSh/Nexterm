@@ -1,8 +1,11 @@
-//! `rrs` — developer/test harness for the rust-remote-suite core.
+//! `rrs` — developer/test harness for the Nexterm core.
 //!
-//! Exercises the core (profiles, the mock SSH transport, the HTTP mini-server,
-//! highlighting, the danger scanner) without any GUI. Run with `RUST_LOG=debug`
-//! for verbose tracing. Secrets are never printed.
+//! Exercises the core (profiles, the mock/real SSH transports, local PTY shell,
+//! the HTTP mini-server, highlighting, the danger scanner) without any GUI. Run
+//! with `RUST_LOG=debug` for verbose tracing. Secrets are never printed.
+//!
+//! TODO(rename): the binary is still `rrs` and crates are `rrs-*`; rename to
+//! `nexterm` / `nexterm-*` in a dedicated churn-only pass once the brand settles.
 
 use std::sync::Arc;
 
@@ -18,7 +21,7 @@ use rrs_terminal::{builtin_profiles, LineHighlighter};
 use rrs_ui_common::{scan_dangerous, AppCore};
 
 #[derive(Parser)]
-#[command(name = "rrs", version, about = "rust-remote-suite dev harness")]
+#[command(name = "rrs", version, about = "Nexterm dev harness (rrs)")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -56,14 +59,36 @@ enum Command {
         #[arg(long)]
         program: Option<String>,
     },
+    /// Connect over real SSH and run one command (needs `--features ssh-russh`).
+    ///
+    /// Dev harness only: the password is read from an environment variable
+    /// (default `NEXTERM_SSH_PASSWORD`) and never printed. This is not the final
+    /// credential UX — production stores secrets in the OS keyring.
+    #[cfg(feature = "ssh-russh")]
+    SshConnect {
+        #[arg(long)]
+        host: String,
+        #[arg(long, default_value_t = 22)]
+        port: u16,
+        #[arg(long, default_value = "root")]
+        user: String,
+        /// Command to run; defaults to a harmless probe.
+        #[arg(long)]
+        command: Option<String>,
+        /// Path to a private key file (publickey auth).
+        #[arg(long)]
+        key: Option<String>,
+        /// Env var holding the password (dev-only).
+        #[arg(long, default_value = "NEXTERM_SSH_PASSWORD")]
+        password_env: String,
+        /// Disable known_hosts checking (accept unknown host keys).
+        #[arg(long)]
+        insecure: bool,
+    },
     /// Show highlight spans for a line of text.
-    Highlight {
-        text: String,
-    },
+    Highlight { text: String },
     /// Check a command against the multi-exec danger rules.
-    DangerCheck {
-        command: String,
-    },
+    DangerCheck { command: String },
 }
 
 #[derive(Subcommand)]
@@ -94,6 +119,16 @@ async fn main() -> anyhow::Result<()> {
         Command::ServeHttp { root, port, bind } => cmd_serve_http(root, port, bind).await,
         Command::SshDemo { name } => cmd_ssh_demo(name).await,
         Command::LocalShell { command, program } => cmd_local_shell(command, program).await,
+        #[cfg(feature = "ssh-russh")]
+        Command::SshConnect {
+            host,
+            port,
+            user,
+            command,
+            key,
+            password_env,
+            insecure,
+        } => cmd_ssh_connect(host, port, user, command, key, password_env, insecure).await,
         Command::Highlight { text } => cmd_highlight(text),
         Command::DangerCheck { command } => cmd_danger_check(command),
     }
@@ -148,7 +183,10 @@ async fn cmd_profiles(action: ProfileAction) -> anyhow::Result<()> {
         ProfileAction::AddSsh { name, host, user } => {
             let profile = ConnectionProfile::new_ssh(name, host, user);
             let id = profile.id;
-            store.upsert_profile(profile).await.context("saving profile")?;
+            store
+                .upsert_profile(profile)
+                .await
+                .context("saving profile")?;
             println!("added profile {id}");
             Ok(())
         }
@@ -164,7 +202,9 @@ async fn cmd_serve_http(root: String, port: u16, bind: String) -> anyhow::Result
     let mut server = HttpFileServer::new(config);
     server.start().await.context("starting http server")?;
     println!("HTTP file server running. Press Ctrl-C to stop.");
-    tokio::signal::ctrl_c().await.context("waiting for ctrl-c")?;
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for ctrl-c")?;
     server.stop().await.context("stopping http server")?;
     println!("stopped.");
     Ok(())
@@ -210,6 +250,59 @@ async fn cmd_local_shell(command: Option<String>, program: Option<String>) -> an
     Ok(())
 }
 
+#[cfg(feature = "ssh-russh")]
+#[allow(clippy::too_many_arguments)]
+async fn cmd_ssh_connect(
+    host: String,
+    port: u16,
+    user: String,
+    command: Option<String>,
+    key: Option<String>,
+    password_env: String,
+    insecure: bool,
+) -> anyhow::Result<()> {
+    use rrs_core::model::{CredentialRef, ProtocolSettings};
+    use rrs_credentials::Secret;
+    use rrs_protocols::RusshConnector;
+
+    let credentials = Arc::new(MemoryCredentialStore::new());
+    let connector = Arc::new(RusshConnector);
+    let core = Arc::new(AppCore::with_defaults(credentials, connector).await?);
+
+    let mut profile = ConnectionProfile::new_ssh("ssh-connect", &host, &user);
+    if let ProtocolSettings::Ssh(s) = &mut profile.settings {
+        s.port = port;
+        s.private_key_path = key;
+        s.strict_host_key_checking = !insecure;
+    }
+
+    // Dev-only: pull the password from the environment and stash it in the
+    // (in-memory) credential store, so it flows through the normal transient
+    // resolve path. The value is never printed.
+    if let Ok(pw) = std::env::var(&password_env) {
+        if !pw.is_empty() {
+            profile.credential = Some(CredentialRef::new("ssh-connect-cli"));
+            core.set_profile_secret(&profile, Secret::new(pw)).await?;
+        }
+    }
+
+    let (id, mut session) = core.connect(&profile).await.context("ssh connect")?;
+    println!("session {id} connected (ssh)");
+
+    let cmd = command.unwrap_or_else(|| "echo SSH_OK; uname -a".to_string());
+    session.write(format!("{cmd}\nexit\n").as_bytes()).await?;
+    loop {
+        let chunk = session.read().await?;
+        if chunk.is_empty() {
+            break;
+        }
+        print!("{}", String::from_utf8_lossy(&chunk));
+    }
+    session.close().await?;
+    println!("\n(ssh-connect complete)");
+    Ok(())
+}
+
 fn cmd_highlight(text: String) -> anyhow::Result<()> {
     let profile = &builtin_profiles()[0];
     let hl = LineHighlighter::from_profile(profile).context("compiling highlight rules")?;
@@ -219,7 +312,13 @@ fn cmd_highlight(text: String) -> anyhow::Result<()> {
         println!("(no matches)");
     }
     for s in spans {
-        println!("  [{:>3}..{:<3}] {:?}  {:?}", s.start, s.end, s.style, &text[s.start..s.end]);
+        println!(
+            "  [{:>3}..{:<3}] {:?}  {:?}",
+            s.start,
+            s.end,
+            s.style,
+            &text[s.start..s.end]
+        );
     }
     Ok(())
 }

@@ -49,7 +49,10 @@ pub enum BroadcastDecision {
     /// Safe to send to these targets.
     Ready { targets: Vec<Uuid> },
     /// Flagged; the UI must confirm before proceeding.
-    NeedsConfirmation { targets: Vec<Uuid>, warnings: Vec<DangerWarning> },
+    NeedsConfirmation {
+        targets: Vec<Uuid>,
+        warnings: Vec<DangerWarning>,
+    },
 }
 
 /// Decide whether `input` can be broadcast immediately or needs confirmation.

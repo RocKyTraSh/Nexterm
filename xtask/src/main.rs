@@ -8,7 +8,9 @@ use std::process::Command;
 use anyhow::{bail, Context};
 
 fn main() -> anyhow::Result<()> {
-    let task = std::env::args().nth(1).unwrap_or_else(|| "help".to_string());
+    let task = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "help".to_string());
     match task.as_str() {
         "build" => cargo(&["build", "--workspace"]),
         "build-release" => cargo(&["build", "--workspace", "--release"]),

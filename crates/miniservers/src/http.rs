@@ -22,7 +22,11 @@ pub struct HttpFileServer {
 
 impl HttpFileServer {
     pub fn new(config: MiniServerConfig) -> Self {
-        Self { config, state: ServerState::Stopped, shutdown: None }
+        Self {
+            config,
+            state: ServerState::Stopped,
+            shutdown: None,
+        }
     }
 }
 
@@ -40,7 +44,11 @@ impl MiniServer for HttpFileServer {
         if self.state == ServerState::Running {
             return Ok(());
         }
-        let root = self.config.root_dir.clone().unwrap_or_else(|| ".".to_string());
+        let root = self
+            .config
+            .root_dir
+            .clone()
+            .unwrap_or_else(|| ".".to_string());
         let serve_dir = ServeDir::new(root);
         // If a future axum version rejects a bare Router here, use
         // `app.into_make_service()`.

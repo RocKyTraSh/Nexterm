@@ -18,7 +18,10 @@ pub enum ConflictCheck {
     /// Remote is unchanged; safe to upload.
     Safe,
     /// Remote changed since download; the UI must ask how to proceed.
-    Conflict { snapshot: RemoteSnapshot, current: RemoteSnapshot },
+    Conflict {
+        snapshot: RemoteSnapshot,
+        current: RemoteSnapshot,
+    },
 }
 
 /// Compare the snapshot taken at download against the current remote stat.
@@ -26,7 +29,10 @@ pub fn check_conflict(snapshot: &RemoteSnapshot, current: &RemoteSnapshot) -> Co
     if snapshot == current {
         ConflictCheck::Safe
     } else {
-        ConflictCheck::Conflict { snapshot: snapshot.clone(), current: current.clone() }
+        ConflictCheck::Conflict {
+            snapshot: snapshot.clone(),
+            current: current.clone(),
+        }
     }
 }
 
@@ -36,9 +42,18 @@ mod tests {
 
     #[test]
     fn detects_change() {
-        let a = RemoteSnapshot { size: 100, modified_unix: Some(1000) };
-        let b = RemoteSnapshot { size: 120, modified_unix: Some(1001) };
+        let a = RemoteSnapshot {
+            size: 100,
+            modified_unix: Some(1000),
+        };
+        let b = RemoteSnapshot {
+            size: 120,
+            modified_unix: Some(1001),
+        };
         assert_eq!(check_conflict(&a, &a), ConflictCheck::Safe);
-        assert!(matches!(check_conflict(&a, &b), ConflictCheck::Conflict { .. }));
+        assert!(matches!(
+            check_conflict(&a, &b),
+            ConflictCheck::Conflict { .. }
+        ));
     }
 }

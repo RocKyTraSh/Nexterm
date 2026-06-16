@@ -31,7 +31,10 @@ pub struct FileProfileStore {
 
 impl FileProfileStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into(), lock: Mutex::new(()) }
+        Self {
+            path: path.into(),
+            lock: Mutex::new(()),
+        }
     }
 
     /// Default location: `<data_dir>/profiles.json`.
@@ -73,7 +76,12 @@ impl ProfileStore for FileProfileStore {
     }
 
     async fn get_profile(&self, id: Uuid) -> Result<Option<ConnectionProfile>> {
-        Ok(self.read_data().await?.profiles.into_iter().find(|p| p.id == id))
+        Ok(self
+            .read_data()
+            .await?
+            .profiles
+            .into_iter()
+            .find(|p| p.id == id))
     }
 
     async fn upsert_profile(&self, profile: ConnectionProfile) -> Result<()> {
