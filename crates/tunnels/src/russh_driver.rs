@@ -113,6 +113,26 @@ impl RusshTunnelDriver {
         Ok(Self::from_connection(Arc::new(conn)))
     }
 
+    /// Establish a transport to `target` **through an ordered chain of
+    /// gateways** (`gateways[0] → … → target`), and drive forwards over the
+    /// final target SSH session.
+    ///
+    /// This is what makes remote (`ssh -R`) forwarding work through a jump
+    /// chain: the resulting connection is the target's, so `tcpip-forward` is
+    /// requested on the target and `forwarded-tcpip` channels arrive back over
+    /// the target session (tunnelled through the chain). Local/dynamic forwards
+    /// over a chain also work — their `direct-tcpip` opens on the target.
+    pub async fn connect_via_jump_chain(
+        gateways: &[(&SshSettings, &ResolvedCredentials)],
+        target: &SshSettings,
+        target_creds: &ResolvedCredentials,
+    ) -> Result<Self> {
+        let conn = SshConnection::connect_via_jump_chain(gateways, target, target_creds)
+            .await
+            .map_err(|e| TunnelError::Driver(e.to_string()))?;
+        Ok(Self::from_connection(Arc::new(conn)))
+    }
+
     /// Build a driver over an already-established connection (e.g. one shared
     /// with a shell, or a jump-host connection).
     pub fn from_connection(conn: Arc<SshConnection>) -> Self {
@@ -762,5 +782,104 @@ mod tests {
         assert_eq!(&buf, b"ping", "echo through remote forward mismatch");
 
         mgr.stop(id).await.expect("stop remote forward");
+    }
+
+    /// Live remote-forward-through-jump-chain round-trip. Ignored by default
+    /// (needs reachable gateway(s) + target sshd, where the target permits
+    /// `AllowTcpForwarding`). The `tcpip-forward` is requested on the **target**
+    /// (the last hop), and `forwarded-tcpip` channels come back through the
+    /// chain. Run e.g.:
+    ///
+    /// ```text
+    /// NEXTERM_CHAIN_JUMP1_HOST=gw1 NEXTERM_CHAIN_JUMP1_USER=$USER NEXTERM_CHAIN_JUMP1_KEY=~/.ssh/id_ed25519 \
+    /// NEXTERM_CHAIN_JUMP2_HOST=gw2 NEXTERM_CHAIN_JUMP2_USER=$USER NEXTERM_CHAIN_JUMP2_KEY=~/.ssh/id_ed25519 \
+    /// NEXTERM_CHAIN_TARGET_HOST=t  NEXTERM_CHAIN_TARGET_USER=root NEXTERM_CHAIN_TARGET_KEY=~/.ssh/id_ed25519 \
+    /// NEXTERM_REMOTE_CHAIN_TEST_BIND=127.0.0.1:18080 \
+    /// cargo test -p rrs-tunnels --features ssh-russh -- --ignored remote_tunnel_chain_roundtrip
+    /// ```
+    ///
+    /// `NEXTERM_CHAIN_JUMP2_*` is optional (use a single gateway if unset).
+    #[tokio::test]
+    #[ignore = "requires reachable gateway(s) + target sshd with TCP forwarding; see doc comment"]
+    async fn remote_tunnel_chain_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        fn hop(prefix: &str) -> SshSettings {
+            SshSettings {
+                host: std::env::var(format!("{prefix}_HOST")).expect("HOST"),
+                username: std::env::var(format!("{prefix}_USER")).expect("USER"),
+                private_key_path: std::env::var(format!("{prefix}_KEY")).ok(),
+                strict_host_key_checking: false,
+                ..SshSettings::default()
+            }
+        }
+
+        // Gateways in connection order (JUMP2 optional).
+        let mut gw_settings = vec![hop("NEXTERM_CHAIN_JUMP1")];
+        if std::env::var_os("NEXTERM_CHAIN_JUMP2_HOST").is_some() {
+            gw_settings.push(hop("NEXTERM_CHAIN_JUMP2"));
+        }
+        let target = hop("NEXTERM_CHAIN_TARGET");
+        let nocreds = ResolvedCredentials::default();
+        let gateways: Vec<(&SshSettings, &ResolvedCredentials)> =
+            gw_settings.iter().map(|s| (s, &nocreds)).collect();
+
+        let remote_bind = std::env::var("NEXTERM_REMOTE_CHAIN_TEST_BIND")
+            .unwrap_or_else(|_| "127.0.0.1:18080".into());
+        let (rbind_host, rbind_port) = remote_bind.rsplit_once(':').expect("host:port");
+        let rbind_port: u16 = rbind_port.parse().expect("port");
+
+        // Local echo server (the `-R` local target on this machine).
+        let echo = TcpListener::bind("127.0.0.1:0").await.expect("echo bind");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        tokio::spawn(async move {
+            while let Ok((mut c, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let mut b = [0u8; 1024];
+                    while let Ok(n) = c.read(&mut b).await {
+                        if n == 0 || c.write_all(&b[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        // The driver's connection is the target's, reached through the chain.
+        let driver = RusshTunnelDriver::connect_via_jump_chain(&gateways, &target, &nocreds)
+            .await
+            .expect("chain connect for tunnel");
+        let mut mgr = TunnelManager::new(Box::new(driver));
+
+        let spec = TunnelSpec::new_remote(
+            "remote-chain",
+            Uuid::new_v4(),
+            rbind_host,
+            rbind_port,
+            "127.0.0.1",
+            echo_addr.port(),
+        );
+        let id = mgr.add(spec);
+        mgr.start(id).await.expect("start remote forward via chain");
+
+        // A second chain connection to reach the target's remote bind and probe.
+        let probe = Arc::new(
+            SshConnection::connect_via_jump_chain(&gateways, &target, &nocreds)
+                .await
+                .expect("probe chain connect"),
+        );
+        let mut stream = probe
+            .open_forward_stream(rbind_host, rbind_port)
+            .await
+            .expect("reach remote bind via target");
+        stream.write_all(b"ping").await.expect("write");
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.expect("read echo");
+        assert_eq!(
+            &buf, b"ping",
+            "echo through remote forward via chain mismatch"
+        );
+
+        mgr.stop(id).await.expect("stop remote forward via chain");
     }
 }

@@ -189,6 +189,19 @@ cargo run -p rrs-cli --features ssh-russh -- tunnel-remote \
 #   3. НА SSH-СЕРВЕРЕ: curl http://127.0.0.1:18080  → ответит локальный python.
 # Нужен server-side AllowTcpForwarding; bind на 0.0.0.0 требует GatewayPorts.
 
+# Remote port-forward (ssh -R) ЧЕРЕЗ jump-chain (нужна фича ssh-russh):
+#   bind происходит на FINAL TARGET; forwarded-tcpip каналы идут обратно через chain.
+#   1. На локальной машине: python -m http.server 8080 --bind 127.0.0.1
+#   2. Подключитесь к target через gateway'и и запросите -R на target:
+NEXTERM_JUMP1_PASSWORD='pw1' NEXTERM_TARGET_PASSWORD='pwt' \
+cargo run -p rrs-cli --features ssh-russh -- tunnel-remote-chain \
+  --jump gw:user --target target:user \
+  --remote-bind 127.0.0.1:18080 --local-target 127.0.0.1:8080
+#   Несколько gateway'ев — повторяя --jump в порядке подключения; общий --key.
+#   3. НА TARGET SSH-СЕРВЕРЕ: curl http://127.0.0.1:18080  → ответит локальный python.
+# Нужен AllowTcpForwarding на target; non-loopback bind — GatewayPorts; gateways
+# должны разрешать direct-tcpip к следующему hop. Bind НЕ на gateway, а на target.
+
 # SFTP: листинг каталога (нужна фича ssh-russh). Пароль — из env (dev-only):
 NEXTERM_SSH_PASSWORD='secret' \
 cargo run -p rrs-cli --features ssh-russh -- sftp-ls \
@@ -302,34 +315,42 @@ cargo test --workspace
       юнит-тестами, в default-сборке (без `russh`). SOCKS success-reply шлётся
       только после успешного открытия `direct-tcpip`; на ошибки — корректный
       failure-reply.
-    - **Remote (`-R`)** (`tunnel-remote`): через `tcpip-forward` сервер слушает
+    - **Remote (`-R`)** — direct (`tunnel-remote`) **и через jump-chain**
+      (`tunnel-remote-chain`): через `tcpip-forward` target-сервер слушает
       `--remote-bind` и открывает обратно к клиенту `forwarded-tcpip` каналы; на
       каждый канал Nexterm подключается к `--local-target` (на машине клиента) и
       прокачивает байты. Входящие каналы доставляются через handler соединения
-      (`ForwardedConnection`). Remote bind port `0` поддержан (сервер выбирает
-      порт, он логируется). На `stop`/Ctrl-C — `cancel-tcpip-forward`. Одно
-      SSH-соединение держит **один** активный `-R` (receiver берётся один раз).
-      Ограничения: нужен server-side `AllowTcpForwarding`; bind на non-loopback
-      требует `GatewayPorts`; bind на привилегированный порт может требовать root
-      на сервере. Через jump-chain `-R` пока не делается.
+      (`ForwardedConnection`). **Для chain `tcpip-forward` запрашивается на FINAL
+      TARGET** (последний hop), `forwarded-tcpip` идут обратно через цепочку —
+      `RusshTunnelDriver::connect_via_jump_chain` строит target-соединение через
+      gateway'и и драйвит `-R` поверх него. Remote bind port `0` поддержан
+      (сервер выбирает порт, он логируется). На `stop`/Ctrl-C —
+      `cancel-tcpip-forward`. Одно SSH-соединение держит **один** активный `-R`
+      (receiver берётся один раз). Ограничения: нужен `AllowTcpForwarding` на
+      target; bind на non-loopback требует `GatewayPorts`; привилегированный порт
+      может требовать root; gateways должны разрешать `direct-tcpip` к следующему
+      hop. Несколько `-R` на одно соединение пока не поддержано.
     Драйвер живёт в `crates/tunnels` (фича `ssh-russh`, dep `rrs-protocols`);
     граф остаётся однонаправленным `tunnels → protocols → core`.
   - Все dev CLI-команды (`ssh-connect`, `ssh-jump-connect`, `ssh-chain-connect`,
-    `tunnel-local`, `tunnel-socks`, `tunnel-remote`, `sftp-ls`, `sftp-jump-ls`,
-    `sftp-chain-ls`) читают пароли из env — это **временный dev-харнесс**, не
-    финальный UX: в проде секрет лежит в OS-keyring и резолвится транзиентно.
+    `tunnel-local`, `tunnel-socks`, `tunnel-remote`, `tunnel-remote-chain`,
+    `sftp-ls`, `sftp-jump-ls`, `sftp-chain-ls`) читают пароли из env — это
+    **временный dev-харнесс**, не финальный UX: в проде секрет лежит в OS-keyring
+    и резолвится транзиентно.
   - Live-проверки помечены `#[ignore]` и требуют sshd:
     `jump_host_roundtrip`, `sftp_jump_roundtrip`, `jump_chain_roundtrip`,
     `sftp_jump_chain_roundtrip` (`rrs-protocols`; single-hop — env
     `NEXTERM_JUMP_TEST_*` + `NEXTERM_TARGET_TEST_*`; chain — `NEXTERM_CHAIN_JUMP1_*`,
     `NEXTERM_CHAIN_JUMP2_*`, `NEXTERM_CHAIN_TARGET_*` + `NEXTERM_CHAIN_TARGET_SFTP_PATH`),
-    `local_tunnel_roundtrip`, `dynamic_socks_roundtrip` и `remote_tunnel_roundtrip`
-    (`rrs-tunnels`, env `NEXTERM_SSH_TEST_*`; для `-R` ещё `NEXTERM_REMOTE_TEST_BIND`;
-    для curl-проверки SOCKS — `NEXTERM_SOCKS_TEST_URL`), `agent_forwarding_roundtrip`
-    (`rrs-protocols`, env `NEXTERM_SSH_TEST_*` + запущенный `SSH_AUTH_SOCK`), плюс
-    `sftp_roundtrip` (direct).
-  - Ещё не сделано: remote (`-R`) через jump-chain; несколько `-R` на одно
-    соединение; отдельный `CredentialRef` для key-passphrase.
+    `local_tunnel_roundtrip`, `dynamic_socks_roundtrip`, `remote_tunnel_roundtrip`
+    и `remote_tunnel_chain_roundtrip` (`rrs-tunnels`, env `NEXTERM_SSH_TEST_*` или
+    `NEXTERM_CHAIN_*`; для `-R` ещё `NEXTERM_REMOTE_TEST_BIND` /
+    `NEXTERM_REMOTE_CHAIN_TEST_BIND`; для curl-проверки SOCKS —
+    `NEXTERM_SOCKS_TEST_URL`), `agent_forwarding_roundtrip` (`rrs-protocols`, env
+    `NEXTERM_SSH_TEST_*` + запущенный `SSH_AUTH_SOCK`), плюс `sftp_roundtrip`
+    (direct).
+  - Ещё не сделано: несколько `-R` на одно соединение; отдельный `CredentialRef`
+    для key-passphrase.
 - `pty` — локальный shell через PTY (`portable-pty`), в крейте `rrs-terminal`.
 - `local-pty` (на `rrs-cli`/`rrs-protocols`) — local-shell как полноценный транспорт
   через `AppCore::connect` (`LocalShellConnector`/`LocalPtySession`); тянет `pty`.

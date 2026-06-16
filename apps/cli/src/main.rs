@@ -220,6 +220,36 @@ enum Command {
         #[arg(long)]
         insecure: bool,
     },
+    /// Run a remote port-forward (`ssh -R`) through a CHAIN of jump hosts until
+    /// Ctrl-C (needs `--features ssh-russh`).
+    ///
+    /// Connects to the target through `--jump` gateways (in order), then requests
+    /// `tcpip-forward` on the **target** so it listens on `--remote-bind` and
+    /// forwards back through the chain to `--local-target` on this machine.
+    /// Per-hop passwords come from `NEXTERM_JUMP<i>_PASSWORD` (1-based) and
+    /// `NEXTERM_TARGET_PASSWORD`; a shared `--key` enables publickey auth on
+    /// every hop. Passwords are never printed.
+    #[cfg(feature = "ssh-russh")]
+    TunnelRemoteChain {
+        /// Gateway `HOST:USER` (port 22). Repeat in connection order.
+        #[arg(long = "jump", required = true)]
+        jumps: Vec<String>,
+        /// Target `HOST:USER` (port 22).
+        #[arg(long)]
+        target: String,
+        /// Shared private key applied to every hop (publickey auth).
+        #[arg(long)]
+        key: Option<String>,
+        /// Remote listen address on the target SSH server, `host:port` (port 0 = server picks).
+        #[arg(long)]
+        remote_bind: String,
+        /// Local destination on this machine, `host:port` (e.g. 127.0.0.1:8080).
+        #[arg(long)]
+        local_target: String,
+        /// Disable known_hosts checking for all hops (accept unknown keys).
+        #[arg(long)]
+        insecure: bool,
+    },
     /// List a remote directory over SFTP (needs `--features ssh-russh`).
     ///
     /// Dev harness: the password is read from `--password-env` (default
@@ -490,6 +520,15 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        #[cfg(feature = "ssh-russh")]
+        Command::TunnelRemoteChain {
+            jumps,
+            target,
+            key,
+            remote_bind,
+            local_target,
+            insecure,
+        } => cmd_tunnel_remote_chain(jumps, target, key, remote_bind, local_target, insecure).await,
         #[cfg(feature = "ssh-russh")]
         Command::SftpLs {
             host,
@@ -1036,6 +1075,88 @@ async fn cmd_tunnel_remote(
     Ok(())
 }
 
+#[cfg(feature = "ssh-russh")]
+async fn cmd_tunnel_remote_chain(
+    jumps: Vec<String>,
+    target: String,
+    key: Option<String>,
+    remote_bind: String,
+    local_target: String,
+    insecure: bool,
+) -> anyhow::Result<()> {
+    use rrs_core::model::SshSettings;
+    use rrs_protocols::ResolvedCredentials;
+    use rrs_tunnels::{RusshTunnelDriver, TunnelManager, TunnelSpec};
+    use uuid::Uuid;
+
+    let (remote_bind_host, remote_bind_port) =
+        split_host_port(&remote_bind).context("parsing --remote-bind")?;
+    let (local_host, local_port) =
+        split_host_port(&local_target).context("parsing --local-target")?;
+
+    let strict = !insecure;
+    let hop = |host: &str, user: &str| SshSettings {
+        host: host.to_string(),
+        port: 22,
+        username: user.to_string(),
+        private_key_path: key.clone(),
+        strict_host_key_checking: strict,
+        ..SshSettings::default()
+    };
+
+    // Gateways in connection order; per-hop password from NEXTERM_JUMP<i>_PASSWORD.
+    let mut gw_owned: Vec<(SshSettings, ResolvedCredentials)> = Vec::with_capacity(jumps.len());
+    for (i, spec) in jumps.iter().enumerate() {
+        let (host, user) = parse_hop(spec)?;
+        gw_owned.push((hop(&host, &user), creds_from_env(&jump_password_env(i))));
+    }
+    let (thost, tuser) = parse_hop(&target)?;
+    let target_ssh = hop(&thost, &tuser);
+    let target_creds = creds_from_env("NEXTERM_TARGET_PASSWORD");
+
+    let gateways: Vec<(&SshSettings, &ResolvedCredentials)> =
+        gw_owned.iter().map(|(s, c)| (s, c)).collect();
+
+    println!(
+        "establishing SSH connection to {thost} via chain: {} ...",
+        jumps.join(" -> ")
+    );
+    let driver = RusshTunnelDriver::connect_via_jump_chain(&gateways, &target_ssh, &target_creds)
+        .await
+        .map_err(|e| anyhow::anyhow!("chain connect for tunnel: {e}"))?;
+    let mut mgr = TunnelManager::new(Box::new(driver));
+
+    let spec = TunnelSpec::new_remote(
+        "cli-remote-chain",
+        Uuid::new_v4(),
+        remote_bind_host.clone(),
+        remote_bind_port,
+        local_host.clone(),
+        local_port,
+    );
+    let id = mgr.add(spec);
+    mgr.start(id)
+        .await
+        .map_err(|e| anyhow::anyhow!("starting remote forward: {e}"))?;
+
+    println!("remote forward (via chain) running:");
+    println!("  chain        : {} -> {thost}", jumps.join(" -> "));
+    println!("  remote bind  : {remote_bind_host}:{remote_bind_port}  (on the target SSH server)");
+    println!("  local target : {local_host}:{local_port}  (on this machine)");
+    println!("  (-R bind happens on the final target; needs target AllowTcpForwarding;");
+    println!("   non-loopback bind needs GatewayPorts; gateways must allow direct-tcpip)");
+    println!("Press Ctrl-C to stop.");
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for ctrl-c")?;
+
+    mgr.stop(id)
+        .await
+        .map_err(|e| anyhow::anyhow!("stopping remote forward: {e}"))?;
+    println!("remote forward stopped.");
+    Ok(())
+}
+
 /// Print an SFTP directory listing (one entry per line).
 #[cfg(feature = "ssh-russh")]
 fn print_listing(path: &str, entries: &[rrs_protocols::DirEntry]) {
@@ -1146,6 +1267,13 @@ fn parse_hop(spec: &str) -> anyhow::Result<(String, String)> {
     Ok((host.to_string(), user.to_string()))
 }
 
+/// Env var holding the password for the `index`-th gateway (0-based → 1-based
+/// `NEXTERM_JUMP<n>_PASSWORD`). Pure (unit-tested).
+#[cfg(feature = "ssh-russh")]
+fn jump_password_env(index: usize) -> String {
+    format!("NEXTERM_JUMP{}_PASSWORD", index + 1)
+}
+
 /// A resolved jump chain: ordered gateways (profile + creds), then the target
 /// profile and its creds.
 #[cfg(feature = "ssh-russh")]
@@ -1180,7 +1308,7 @@ fn build_chain(
             strict,
             false,
         );
-        let creds = creds_from_env(&format!("NEXTERM_JUMP{}_PASSWORD", i + 1));
+        let creds = creds_from_env(&jump_password_env(i));
         gateways.push((profile, creds));
     }
     let (thost, tuser) = parse_hop(target)?;
@@ -1289,4 +1417,29 @@ fn cmd_danger_check(command: String) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "ssh-russh"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hop_accepts_host_user_and_rejects_bad() {
+        assert_eq!(
+            parse_hop("gw1:user1").unwrap(),
+            ("gw1".to_string(), "user1".to_string())
+        );
+        // No colon.
+        assert!(parse_hop("gw1").is_err());
+        // Empty host or user.
+        assert!(parse_hop(":user").is_err());
+        assert!(parse_hop("host:").is_err());
+    }
+
+    #[test]
+    fn jump_password_env_is_one_based() {
+        assert_eq!(jump_password_env(0), "NEXTERM_JUMP1_PASSWORD");
+        assert_eq!(jump_password_env(1), "NEXTERM_JUMP2_PASSWORD");
+        assert_eq!(jump_password_env(8), "NEXTERM_JUMP9_PASSWORD");
+    }
 }

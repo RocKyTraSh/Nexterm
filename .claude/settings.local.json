@@ -47,7 +47,10 @@
       "Bash(./target/debug/rrs tunnel-remote *)",
       "Bash(NEXTERM_SSH_PASSWORD=x ./target/debug/rrs tunnel-remote --ssh-host h --ssh-user u --remote-bind nope --local-target 127.0.0.1:8080)",
       "Bash(git rev-list *)",
-      "Bash(git fetch *)"
+      "Bash(git fetch *)",
+      "Bash(git push *)",
+      "Bash(./target/debug/rrs tunnel-remote-chain *)",
+      "Bash(grep -iE \"\\\\.env|\\\\.pem|id_rsa|id_ed25519|\\\\.key$|secret|token|\\\\.pfx|core\\\\.|target/\")"
     ]
   }
 }
