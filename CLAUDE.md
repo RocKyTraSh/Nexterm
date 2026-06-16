@@ -60,7 +60,7 @@ protocols ──▶ core + credentials      tunnels ──▶ core      core ─
 | `crates/credentials` | `Secret` (zeroize) + `CredentialStore` (memory / OS keyring) |
 | `crates/protocols` | `Connector` / `RemoteSession` / `SftpClient` (+ SSH mock и russh-каркас) |
 | `crates/terminal` | подсветка, детект alt-screen, PTY (feature `pty`) |
-| `crates/tunnels` | модель и менеджер SSH-туннелей (+ mock-драйвер) |
+| `crates/tunnels` | модель и менеджер SSH-туннелей (+ mock-драйвер; real local-forward `RusshTunnelDriver` за `ssh-russh`) |
 | `crates/miniservers` | framework мини-серверов + рабочий HTTP + scheduler |
 | `crates/platform` | пути/идентичность ОС (Linux-first) |
 | `crates/ui-common` | `AppCore` (фасад) + multiexec / macros / conflict / safety |
@@ -83,7 +83,9 @@ protocols ──▶ core + credentials      tunnels ──▶ core      core ─
 
 - **edition = "2021"** в `Cargo.toml` (workspace). Код 2024-чистый; бамп до `2024` — одна строка, отложен до первого зелёного билда (приоритет — предсказуемая сборка).
 - **Qt-подход: Rust core + QML через `cxx-qt`.** Альтернативы (тонкий C++/Qt Widgets + QTermWidget через `cxx`; демон + IPC; чистый Rust egui/iced/slint) разобраны и отклонены в `apps/qt/README.md`.
-- **`russh` 0.61 + `russh-sftp` 2.3 — за фичей `ssh-russh`** (крипто-бэкенд `ring`, без nasm; `default-features = false` + `flate2`/`rsa`). `RusshConnector`/`RusshSftp` реализованы (shell + SFTP, auth, known_hosts). Jump-host — `NotImplemented` (seam `connect_via_jump_host`). Host-key проверка через встроенный `russh::keys::check_known_hosts`; политика strict/non-strict — чистые функции `decide_host_key`/`plan_auth` (юнит-тесты).
+- **`russh` 0.61 + `russh-sftp` 2.3 — за фичей `ssh-russh`** (крипто-бэкенд `ring`, без nasm; `default-features = false` + `flate2`/`rsa`). `RusshConnector`/`RusshSftp` реализованы (shell + SFTP, auth, known_hosts). **Single-hop jump-host реализован** через `direct-tcpip` (`SshConnection::connect_via_jump_host` + `RusshConnector::connect_shell_via_jump`). Host-key проверка через встроенный `russh::keys::check_known_hosts`; политика strict/non-strict — чистые функции `decide_host_key`/`plan_auth`/`validate_jump_chain` (юнит-тесты).
+- **Единый SSH-примитив `SshConnection`** (в `russh_impl.rs`): инкапсулирует connect (TCP) / connect через jump (`connect_over_stream` поверх `direct-tcpip`-канала) / host-key / auth и отдаёт `open_shell` / `open_sftp` / `open_forward_stream`. Shell/SFTP/jump/tunnels используют один путь — без копипасты auth/known_hosts. `establish()` удалён (заменён на `SshConnection::connect`).
+- **Real `TunnelDriver` (`RusshTunnelDriver`) живёт в `crates/tunnels` за фичей `ssh-russh`** (optional dep `rrs-protocols`). Граф остаётся однонаправленным: `tunnels → protocols → core` (protocols НЕ зависит от tunnels). Реализован **только local-forwarding (`-L`)**; remote/dynamic → `TunnelError::Unsupported`. Альтернатива (драйвер в protocols, реализующий трейт tunnels) отклонена — она развернула бы граф `protocols → tunnels`.
 - **`chrono` не используем** — `std::time::SystemTime`.
 - **MVP-хранилище — JSON-файл** (`FileProfileStore`, атомарная запись temp+rename). SQLite с миграциями — v0.2, за тем же трейтом.
 - **HTTP мини-сервер — `axum` 0.8 + `tower-http` ServeDir.** Если версия не примет голый `Router` в `axum::serve` → `app.into_make_service()` (помечено в `http.rs`) или закрепить `axum = "0.7"`.
@@ -95,40 +97,52 @@ protocols ──▶ core + credentials      tunnels ──▶ core      core ─
 - `crates/core/src/model/profile.rs` — доменная модель, `CredentialRef`, `ProtocolSettings` (tagged enum, расширяется новыми вариантами).
 - `crates/credentials/src/{secret,backend,memory,keyring_os}.rs` — безопасность секретов.
 - `crates/protocols/src/traits.rs` — `Connector` / `RemoteSession` / `SftpClient` / `ResolvedCredentials`.
-- `crates/protocols/src/ssh/{mock,russh_impl}.rs` — SSH: рабочий mock + **реальный russh-транспорт** (`RusshConnector`/`RusshSession`/`RusshSftp`, auth-план, host-key политика).
+- `crates/protocols/src/ssh/{mock,russh_impl}.rs` — SSH: рабочий mock + **реальный russh-транспорт** (`RusshConnector`/`RusshSession`/`RusshSftp`, auth-план, host-key политика). **`SshConnection`** — переиспользуемый примитив (connect / connect-via-jump / `open_shell`/`open_sftp`/`open_forward_stream`); `DirectTcpipStream` — тип forward-стрима для туннелей.
+- `crates/tunnels/src/{manager,russh_driver}.rs` — `TunnelManager` + трейт `TunnelDriver` + mock; **`RusshTunnelDriver`** (фича `ssh-russh`) — real local-forwarding поверх `SshConnection::open_forward_stream`. Pure-валидация спеков (`bind_endpoint`/`local_forward_target`) под юнит-тестами.
 - `crates/protocols/src/local.rs` — local-shell транспорт (фича `local-pty`): `LocalShellConnector` + `LocalPtySession` поверх `rrs_terminal::pty::LocalPty`.
 - `crates/terminal/src/{altscreen,highlight,pty}.rs` — терминальная логика.
-- `crates/tunnels/src/manager.rs` — `TunnelManager` + `TunnelDriver` + mock + тесты.
 - `crates/miniservers/src/{service,http,scheduler}.rs` — framework + HTTP + scheduler.
 - `apps/cli/src/main.rs` — харнесс для ручной проверки ядра.
 - `apps/qt/README.md` — решение по GUI (decision record).
 
 ## Текущий прогресс
 
-**Готово (с тестами по ключевым крейтам):** workspace и граф зависимостей; модели/конфиг/события/реестр сессий; `ProfileStore` (JSON); `Secret` + `CredentialStore` (memory + `keyring-os`); трейты протоколов + SSH mock; **реальный SSH/SFTP через `russh` (фича `ssh-russh`): PTY-shell `RusshSession`, `RusshSftp`, auth agent→key→password→keyboard-interactive, known_hosts-политика — pure-логика под юнит-тестами, end-to-end проверено против localhost sshd**; подсветка/alt-screen/PTY(feature); local-shell транспорт через `AppCore` (`LocalShellConnector`/`LocalPtySession`, фича `local-pty`, тест с реальным PTY); менеджер туннелей + mock + тесты; HTTP + scheduler мини-серверы; `ui-common` (app/safety/multiexec/macros/conflict); CLI (+ команды `local-shell`, `ssh-connect`); qt/gtk заготовки; xtask; README.
+**Готово (с тестами по ключевым крейтам):** workspace и граф зависимостей; модели/конфиг/события/реестр сессий; `ProfileStore` (JSON); `Secret` + `CredentialStore` (memory + `keyring-os`); трейты протоколов + SSH mock; **реальный SSH/SFTP через `russh` (фича `ssh-russh`): PTY-shell `RusshSession`, `RusshSftp`, auth agent→key→password→keyboard-interactive, known_hosts-политика — pure-логика под юнит-тестами, end-to-end проверено против localhost sshd**; **переиспользуемый примитив `SshConnection`**; **single-hop jump-host через `direct-tcpip`** (`connect_via_jump_host` + `connect_shell_via_jump`, CLI `ssh-jump-connect`); **real local-forwarding `TunnelDriver` (`RusshTunnelDriver`)** в `crates/tunnels` (фича `ssh-russh`, CLI `tunnel-local`); подсветка/alt-screen/PTY(feature); local-shell транспорт через `AppCore` (`LocalShellConnector`/`LocalPtySession`, фича `local-pty`, тест с реальным PTY); менеджер туннелей + mock + тесты; HTTP + scheduler мини-серверы; `ui-common` (app/safety/multiexec/macros/conflict); CLI (+ команды `local-shell`, `ssh-connect`, `ssh-jump-connect`, `tunnel-local`); qt/gtk заготовки; xtask; README.
 
-**НЕ сделано:** jump-host цепочки (`direct-tcpip`) — `RusshConnector::connect_via_jump_host` возвращает `NotImplemented`; SQLite-хранилище; любой GUI; реальный `TunnelDriver`; вендорные пресеты подсветки; полная SGR-aware подсветка; прочие мини-серверы (TFTP/FTP/SSH/Telnet/NFS/VNC); RDP/VNC-клиенты; финальный credential-UX для CLI (`ssh-connect` берёт пароль из env — dev-only).
+**НЕ сделано:** jump-host **цепочки длины > 1** (single-hop готов); SFTP *через* jump-host (примитив есть — `SshConnection::connect_via_jump_host(...).open_sftp()`, но `RusshSftp::connect` его не использует); проброс `agent_forwarding`; **remote (`-R`) и dynamic SOCKS (`-D`) туннели** (`TunnelError::Unsupported`); SQLite-хранилище; любой GUI; вендорные пресеты подсветки; полная SGR-aware подсветка; прочие мини-серверы (TFTP/FTP/SSH/Telnet/NFS/VNC); RDP/VNC-клиенты; финальный credential-UX для CLI (пароли из env — dev-only).
 
-**ВАЖНО:** сборка **верифицирована** (`cargo build`/`cargo test --workspace` + `--features ssh-russh` зелёные, 2026-06-16, rustc 1.96). Дефолтная сборка чистая (без сетевых зависимостей); `local-pty`-тест прогоняет реальный `/bin/sh`; `ssh-russh` — 4 pure-теста + ignored `sftp_roundtrip` (требует sshd). Первый шаг любой сессии всё равно — `cargo build` + `cargo test --workspace`.
+**ВАЖНО:** сборка **верифицирована** (`cargo build`/`cargo test --workspace` + `--features ssh-russh` зелёные, 2026-06-16, rustc 1.96; `fmt --check` и `clippy --all-targets` — 0 варнингов на default и на `ssh-russh` для protocols/tunnels/cli). Дефолтная сборка чистая (`cargo tree --no-default-features` не содержит russh; default-`tunnels` не тянет `rrs-protocols`). `local-pty`-тест прогоняет реальный `/bin/sh`; `ssh-russh` — 5 pure-тестов protocols + 4 pure tunnels, плюс ignored live: `sftp_roundtrip`, `jump_host_roundtrip` (protocols), `local_tunnel_roundtrip` (tunnels) — все требуют sshd. Первый шаг любой сессии всё равно — `cargo build` + `cargo test --workspace`.
 
 ## TODO / Следующие шаги (приоритет v0.2)
 
 1. ~~`cargo build` + `cargo test --workspace`~~ — **готово**, зелёные (см. «Текущий прогресс»). Дефолт остаётся чистым; `portable-pty` 0.8 API подтверждён (используется в `local-pty`).
-2. ~~Реализовать `RusshConnector`~~ — **готово**: `russh` 0.61 + `russh-sftp` 2.3 за фичей `ssh-russh`; auth agent→key→password→keyboard-interactive; known_hosts с учётом `strict_host_key_checking`; PTY-shell + SFTP. **Осталось**: jump-host через `direct-tcpip` (seam `connect_via_jump_host`) — это же разблокирует п.5. После него можно вынести общий примитив SSH-сессии (сейчас `establish()` приватный в `russh_impl.rs`).
+2. ~~Реализовать `RusshConnector`~~ — **готово** (см. п. ниже). ~~jump-host через `direct-tcpip`~~ — **готово**: `SshConnection::connect_via_jump_host` (single-hop) + `RusshConnector::connect_shell_via_jump`, CLI `ssh-jump-connect`. ~~Вынести общий примитив SSH-сессии~~ — **готово**: `SshConnection` (`establish()` удалён).
 3. ~~Провести реальный PTY (`LocalPty`) в адаптер под `RemoteSession`~~ — **готово**: `crates/protocols/src/local.rs` (`LocalShellConnector`/`LocalPtySession`), диспетчеризация по `ProtocolKind` в `AppCore::connect`, фича `local-pty`, CLI-команда `local-shell`. Блокирующие openpty/recv — на `spawn_blocking`.
-4. `SqliteProfileStore` за трейтом `ProfileStore` + миграции.
-5. Реальный `TunnelDriver` через `direct-tcpip` russh (переиспользовать примитив SSH-сессии).
-6. Qt-скелет: одно окно + одна терминальная вкладка поверх `AppCore`; sidebar — модель поверх `ProfileStore`.
+4. ~~Реальный `TunnelDriver` через `direct-tcpip` russh~~ — **готово для local-forwarding**: `RusshTunnelDriver` (`crates/tunnels`, фича `ssh-russh`), CLI `tunnel-local`. **Осталось**: remote (`-R`) и dynamic SOCKS (`-D`) — сейчас `Unsupported`.
+5. **Следующее**: (а) SFTP через jump-host (вызвать `SshConnection::open_sftp` на jump-соединении в `RusshSftp::connect`); (б) jump-host цепочки длины > 1 (рекурсивный `connect_over_stream`); (в) проброс `agent_forwarding`; (г) remote/dynamic туннели; (д) интеграция jump-host в `AppCore`/`ProfileStore` (резолв второго профиля + секрета — сейчас `Connector::connect_shell` с `jump_host.is_some()` возвращает `NotImplemented` и указывает на `connect_shell_via_jump`).
+6. `SqliteProfileStore` за трейтом `ProfileStore` + миграции.
+7. Qt-скелет: одно окно + одна терминальная вкладка поверх `AppCore`; sidebar — модель поверх `ProfileStore`.
 
 ## Ограничения и риски
 
 - Сборка верифицирована (см. «Текущий прогресс»).
-- **known_hosts**: проверка делегирована `russh::keys::check_known_hosts` (поддерживает hashed-записи). Поведение: trusted→accept; unknown→strict отказ / non-strict accept+warning; changed→всегда отказ. Если файла нет / нет HOME — трактуется как unknown (fail-closed в strict). `agent_forwarding` из модели пока не проводится в канал — TODO.
+- **known_hosts**: проверка делегирована `russh::keys::check_known_hosts` (поддерживает hashed-записи). Поведение: trusted→accept; unknown→strict отказ / non-strict accept+warning; changed→всегда отказ. Если файла нет / нет HOME — трактуется как unknown (fail-closed в strict). `agent_forwarding` из модели пока не проводится в канал — TODO. **Jump-host**: оба хоста проверяются независимо своей политикой (`ClientHandler::new(ssh)` на каждый хоп); `--insecure` в CLI отключает strict для обоих.
+- **Jump-host (single-hop)**: `Connector::connect_shell` НЕ умеет резолвить второй профиль/секрет из одного `ConnectionProfile` (трейт не видит сторы) → при `jump_host.is_some()` возвращает `NotImplemented` с указанием на `connect_shell_via_jump`. Реальный путь — резолвить оба хопа в оркестраторе/харнессе и звать `connect_shell_via_jump` (CLI так и делает). `validate_jump_chain` отбраковывает пустые/совпадающие endpoints до открытия сокета.
+- **Tunnel driver**: `RusshTunnelDriver` держит ОДНО SSH-соединение и форвардит по нему все спеки (поле `ssh_profile_id` не ре-резолвится) — один драйвер на endpoint. Один accept-loop + по задаче на соединение; `stop`/`Drop` шлёт broadcast-сигнал и `abort()` accept-loop; дочерние forward-задачи завершаются по сигналу/EOF (`copy_bidirectional`). Нет блокирующего I/O на async-рантайме.
 - **Секрет-гигиена в russh**: пароль/passphrase копируются в `String` для API russh (`authenticate_password`/`load_secret_key`) — это рвёт `zeroize` для копии; копия транзиентна и не логируется. Полный zeroize-aware путь — возможное улучшение.
 - Версионно-чувствительные места (за фичами ВЫКЛ): feature-имена и API `keyring` 3.x (`keyring_os.rs`); сигнатура `axum::serve` (дефолтная сборка — есть fallback в `http.rs`). API `portable-pty` 0.8 и `russh` 0.61 / `russh-sftp` 2.3 — **подтверждены** (собираются и проходят тесты; версии закреплены в `Cargo.lock`).
 - **Крипто-бэкенд russh — `ring`** (выбран вместо дефолтного `aws-lc-rs`, т.к. nasm в окружении отсутствует). Если понадобится `aws-lc-rs` — установить nasm.
 - Linux-first. Windows/macOS — позже, через те же трейты (`CredentialStore` → Windows Credential Manager и т.д.).
 - X-сервер в долгосроке — **обёртки** Xephyr/Xvfb/Xwayland, без переписывания Xorg.
+
+## Итог итерации (2026-06-16): jump-host + tunnel driver
+
+- **Выделен примитив `SshConnection`** в `russh_impl.rs`: единый путь connect (TCP) / connect-via-jump (`connect_over_stream` поверх `direct-tcpip`) / host-key / auth, отдаёт `open_shell`/`open_sftp`/`open_forward_stream`. Приватный `establish()` удалён; shell/SFTP теперь идут через примитив (без копипасты auth/known_hosts).
+- **Single-hop jump-host реализован реально** (не `ssh target` в shell): `SshConnection::connect_via_jump_host` открывает `channel_open_direct_tcpip` на gateway к target и поднимает поверх вторую SSH-сессию (`client::connect_stream`); host-key + auth проверяются для обоих хостов. Публичная точка — `RusshConnector::connect_shell_via_jump`. Пользователь получает shell на target. CLI: `ssh-jump-connect` (пароли из `NEXTERM_JUMP_PASSWORD`/`NEXTERM_TARGET_PASSWORD`, ключи `--jump-key`/`--target-key`).
+- **Real local-forwarding `TunnelDriver`**: `RusshTunnelDriver` в `crates/tunnels` за фичей `ssh-russh` (optional dep `rrs-protocols`; граф `tunnels → protocols → core` остаётся однонаправленным). Биндит listener, на каждое соединение — `direct-tcpip` + `copy_bidirectional`; shutdown через broadcast + `abort`. Только `-L`; `-R`/`-D` → `Unsupported`. CLI: `tunnel-local` (до Ctrl-C, пароль из `NEXTERM_SSH_PASSWORD`).
+- Pure-тесты добавлены: `validate_jump_chain` (protocols), `bind_endpoint`/`local_forward_target`/unsupported-kind (tunnels). Live `#[ignore]`: `jump_host_roundtrip` (protocols), `local_tunnel_roundtrip` (tunnels).
+- Проверки зелёные: `fmt --check`; `build`/`test`/`clippy --all-targets` (default); `build`/`test`/`clippy` для `ssh-russh` на protocols/tunnels/cli — 0 варнингов. `cargo tree --no-default-features` без russh; default-`tunnels` без `rrs-protocols`. Локально проверено: connect+host-key+auth-флоу исполняется (clean fail при неавторизованном ключе); live jump/tunnel требуют sshd с авторизованным ключом — не гонялись в этой среде.
+- **Следующий шаг**: SFTP через jump-host (`open_sftp` на jump-соединении), затем jump-цепочки длины > 1 и remote/dynamic туннели; параллельно — Qt-скелет поверх `AppCore` и резолв jump-профиля в `AppCore`.
 
 ## Итог итерации (2026-06-16): реальный SSH/SFTP
 

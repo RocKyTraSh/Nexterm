@@ -2342,6 +2342,7 @@ dependencies = [
  "rrs-platform",
  "rrs-protocols",
  "rrs-terminal",
+ "rrs-tunnels",
  "rrs-ui-common",
  "tokio",
  "tracing",
@@ -2444,6 +2445,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "rrs-core",
+ "rrs-protocols",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

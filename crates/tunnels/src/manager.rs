@@ -68,6 +68,35 @@ impl TunnelSpec {
             autostart: false,
         }
     }
+
+    /// The `(address, port)` this tunnel binds locally. Errors on an empty
+    /// address. Pure — no socket is opened (unit-tested).
+    pub fn bind_endpoint(&self) -> Result<(String, u16)> {
+        if self.bind_address.trim().is_empty() {
+            return Err(TunnelError::InvalidSpec("empty bind address".into()));
+        }
+        Ok((self.bind_address.clone(), self.bind_port))
+    }
+
+    /// The `(host, port)` a **local** forward must reach. Errors if the target
+    /// fields are missing (they are required for `-L`) or the kind is not
+    /// `Local`. Pure (unit-tested).
+    pub fn local_forward_target(&self) -> Result<(String, u16)> {
+        if self.kind != TunnelKind::Local {
+            return Err(TunnelError::Unsupported(format!("{:?}", self.kind)));
+        }
+        let host = self
+            .target_host
+            .clone()
+            .filter(|h| !h.trim().is_empty())
+            .ok_or_else(|| {
+                TunnelError::InvalidSpec("local forward requires a target host".into())
+            })?;
+        let port = self.target_port.ok_or_else(|| {
+            TunnelError::InvalidSpec("local forward requires a target port".into())
+        })?;
+        Ok((host, port))
+    }
 }
 
 /// Runtime status of a tunnel.
@@ -212,5 +241,67 @@ mod tests {
         let mut mgr2 = TunnelManager::new(Box::new(MockTunnelDriver));
         mgr2.import_specs(&json).unwrap();
         assert_eq!(mgr2.list().len(), 1);
+    }
+
+    #[test]
+    fn local_forward_target_requires_target_fields() {
+        let spec = TunnelSpec::new_local("web", Uuid::new_v4(), 8080, "10.0.0.5", 80);
+        assert_eq!(
+            spec.local_forward_target().unwrap(),
+            ("10.0.0.5".to_string(), 80)
+        );
+        assert_eq!(
+            spec.bind_endpoint().unwrap(),
+            ("127.0.0.1".to_string(), 8080)
+        );
+
+        // Missing target host → InvalidSpec.
+        let mut bad = spec.clone();
+        bad.target_host = None;
+        assert!(matches!(
+            bad.local_forward_target(),
+            Err(TunnelError::InvalidSpec(_))
+        ));
+
+        // Empty target host → InvalidSpec.
+        let mut empty = spec.clone();
+        empty.target_host = Some("  ".into());
+        assert!(matches!(
+            empty.local_forward_target(),
+            Err(TunnelError::InvalidSpec(_))
+        ));
+
+        // Missing target port → InvalidSpec.
+        let mut noport = spec.clone();
+        noport.target_port = None;
+        assert!(matches!(
+            noport.local_forward_target(),
+            Err(TunnelError::InvalidSpec(_))
+        ));
+    }
+
+    #[test]
+    fn dynamic_and_remote_are_unsupported_as_local() {
+        let mut spec = TunnelSpec::new_local("d", Uuid::new_v4(), 1080, "x", 1);
+        spec.kind = TunnelKind::Dynamic;
+        assert!(matches!(
+            spec.local_forward_target(),
+            Err(TunnelError::Unsupported(_))
+        ));
+        spec.kind = TunnelKind::Remote;
+        assert!(matches!(
+            spec.local_forward_target(),
+            Err(TunnelError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn empty_bind_address_is_rejected() {
+        let mut spec = TunnelSpec::new_local("web", Uuid::new_v4(), 8080, "10.0.0.5", 80);
+        spec.bind_address = "  ".into();
+        assert!(matches!(
+            spec.bind_endpoint(),
+            Err(TunnelError::InvalidSpec(_))
+        ));
     }
 }

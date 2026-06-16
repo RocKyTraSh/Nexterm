@@ -11,6 +11,12 @@ pub enum TunnelError {
     #[error("driver error: {0}")]
     Driver(String),
 
+    #[error("tunnel kind not supported by this driver yet: {0}")]
+    Unsupported(String),
+
+    #[error("invalid tunnel spec: {0}")]
+    InvalidSpec(String),
+
     #[error("(de)serialization error: {0}")]
     Serde(String),
 }

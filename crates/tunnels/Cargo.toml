@@ -4,8 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Real port-forwarding driver over an SSH session (russh `direct-tcpip`). OFF by
+# default: pulls in `rrs-protocols/ssh-russh` and, transitively, russh + crypto.
+# Tunnels depend on protocols (not the reverse), so the dependency graph stays
+# unidirectional: tunnels ──▶ protocols ──▶ core.
+ssh-russh = ["dep:rrs-protocols", "rrs-protocols/ssh-russh"]
+
 [dependencies]
 rrs-core = { workspace = true }
+rrs-protocols = { workspace = true, optional = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

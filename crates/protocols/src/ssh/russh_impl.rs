@@ -12,13 +12,23 @@
 //!   keyboard-interactive ([`plan_auth`]);
 //! * an interactive PTY shell exposed as [`RemoteSession`];
 //! * SFTP (`list_dir` / `stat` / `read_file` / `write_file` / `mkdir` /
-//!   `remove` / `rename` / `chmod`) via [`RusshSftp`].
+//!   `remove` / `rename` / `chmod`) via [`RusshSftp`];
+//! * single-hop jump-host (`ProxyJump`) chaining over a `direct-tcpip` channel
+//!   ([`SshConnection::connect_via_jump_host`] +
+//!   [`RusshConnector::connect_shell_via_jump`]);
+//! * a reusable `direct-tcpip` forwarding stream ([`SshConnection::open_forward_stream`])
+//!   that backs the `rrs-tunnels` russh driver.
+//!
+//! The connection lifecycle (TCP/stream connect → host-key check → auth) lives
+//! in one reusable primitive, [`SshConnection`], so shells, SFTP, jump-host
+//! chaining, and tunnels all share the same code path (no copy-pasted auth /
+//! known_hosts logic).
 //!
 //! Not yet implemented (clear errors / TODOs, no fake behavior):
-//! * jump-host chaining — connecting returns `NotImplemented` when
-//!   `SshSettings::jump_host` is set; the `direct-tcpip` primitive is sketched
-//!   in [`RusshConnector::connect_via_jump_host`].
-//! * the `TunnelManager` driver (would reuse the same `channel_open_direct_tcpip`).
+//! * multi-hop jump-host chains (length > 1) — only one gateway is supported;
+//! * SFTP *through* a jump host (the seam exists via [`SshConnection::open_sftp`]
+//!   but is not wired into [`RusshSftp::connect`]);
+//! * agent forwarding into the channel.
 //!
 //! Secrets: passwords / passphrases come from [`ResolvedCredentials`] only, are
 //! never read from the profile, and are never logged.
@@ -30,7 +40,8 @@ use async_trait::async_trait;
 use russh::client::{self, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::client::AgentClient;
 use russh::keys::{load_secret_key, ssh_key, PrivateKeyWithHashAlg};
-use russh::{Channel, ChannelMsg, Disconnect};
+use russh::{Channel, ChannelMsg, ChannelStream, Disconnect};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use rrs_core::model::{AuthMethod, ConnectionProfile, ProtocolSettings, SshSettings};
 
@@ -122,6 +133,18 @@ struct ClientHandler {
     hostkey_status: Arc<AtomicU8>,
 }
 
+impl ClientHandler {
+    /// Build a host-key-verifying handler from SSH settings.
+    fn new(ssh: &SshSettings) -> Self {
+        Self {
+            host: ssh.host.clone(),
+            port: ssh.port,
+            strict: ssh.strict_host_key_checking,
+            hostkey_status: Arc::new(AtomicU8::new(HK_PENDING)),
+        }
+    }
+}
+
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
@@ -170,26 +193,210 @@ impl client::Handler for ClientHandler {
 // Connector
 // ---------------------------------------------------------------------------
 
+/// An `AsyncRead + AsyncWrite` stream carrying a single `direct-tcpip`
+/// forwarding. Returned by [`SshConnection::open_forward_stream`] and pumped
+/// byte-for-byte by the tunnel driver; it is `Unpin`, so it works directly with
+/// `tokio::io::copy_bidirectional`.
+pub type DirectTcpipStream = ChannelStream<client::Msg>;
+
+/// A live, authenticated SSH connection: the single reusable primitive behind
+/// shells, SFTP, jump-host chaining, and tunnels.
+///
+/// Construct one with [`connect`](Self::connect) (direct TCP) or
+/// [`connect_via_jump_host`](Self::connect_via_jump_host) (through a gateway),
+/// then open whatever you need on top: a [shell](Self::open_shell), an
+/// [SFTP session](Self::open_sftp), or a [forwarding stream](Self::open_forward_stream).
+pub struct SshConnection {
+    handle: Handle<ClientHandler>,
+    /// An optional underlying connection (e.g. a jump host) kept alive for this
+    /// connection's lifetime: the target SSH runs over a `direct-tcpip` channel
+    /// of the gateway, so dropping the gateway would tear down the transport.
+    _via: Option<Box<SshConnection>>,
+}
+
+impl SshConnection {
+    /// Connect over a fresh TCP socket, verify the host key, and authenticate.
+    pub async fn connect(ssh: &SshSettings, creds: &ResolvedCredentials) -> Result<Self> {
+        let config = Arc::new(client::Config::default());
+        let mut handle = client::connect(
+            config,
+            (ssh.host.clone(), ssh.port),
+            ClientHandler::new(ssh),
+        )
+        .await
+        .map_err(|e| ProtocolError::Connect(e.to_string()))?;
+        authenticate(&mut handle, ssh, creds).await?;
+        Ok(Self { handle, _via: None })
+    }
+
+    /// Run the SSH handshake over an already-established byte stream (e.g. a
+    /// jump host's `direct-tcpip` channel), then verify and authenticate. The
+    /// `via` connection is retained so the underlying transport stays open.
+    async fn connect_over_stream<R>(
+        ssh: &SshSettings,
+        creds: &ResolvedCredentials,
+        stream: R,
+        via: SshConnection,
+    ) -> Result<Self>
+    where
+        R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let config = Arc::new(client::Config::default());
+        let mut handle = client::connect_stream(config, stream, ClientHandler::new(ssh))
+            .await
+            .map_err(|e| ProtocolError::Connect(e.to_string()))?;
+        authenticate(&mut handle, ssh, creds).await?;
+        Ok(Self {
+            handle,
+            _via: Some(Box::new(via)),
+        })
+    }
+
+    /// Connect to `target_ssh` through the gateway `jump_ssh`: open a
+    /// `direct-tcpip` channel on the gateway to the target's `host:port`, then
+    /// run a full SSH session (host-key check + auth) over that channel.
+    ///
+    /// Single hop only. Both endpoints are verified independently against their
+    /// own `known_hosts` policy; secrets for each come from their own
+    /// [`ResolvedCredentials`].
+    pub async fn connect_via_jump_host(
+        jump_ssh: &SshSettings,
+        jump_creds: &ResolvedCredentials,
+        target_ssh: &SshSettings,
+        target_creds: &ResolvedCredentials,
+    ) -> Result<Self> {
+        validate_jump_chain(jump_ssh, target_ssh)?;
+
+        // 1. Establish + authenticate the gateway.
+        let jump = SshConnection::connect(jump_ssh, jump_creds).await?;
+
+        // 2. Ask the gateway to open a TCP connection to the target.
+        let channel = jump
+            .handle
+            .channel_open_direct_tcpip(
+                target_ssh.host.clone(),
+                target_ssh.port as u32,
+                "127.0.0.1",
+                0,
+            )
+            .await
+            .map_err(|e| ProtocolError::Connect(format!("jump host direct-tcpip failed: {e}")))?;
+
+        // 3. Run the target SSH session over that channel's byte stream.
+        SshConnection::connect_over_stream(target_ssh, target_creds, channel.into_stream(), jump)
+            .await
+    }
+
+    /// Open a bare session channel on this connection.
+    async fn open_session_channel(&self) -> Result<Channel<client::Msg>> {
+        self.handle
+            .channel_open_session()
+            .await
+            .map_err(|e| ProtocolError::Channel(e.to_string()))
+    }
+
+    /// Open an interactive PTY shell, consuming the connection (the resulting
+    /// [`RusshSession`] keeps it — and any gateway — alive).
+    pub async fn open_shell(self) -> Result<RusshSession> {
+        let channel = self.open_session_channel().await?;
+        channel
+            .request_pty(false, DEFAULT_TERM, DEFAULT_COLS, DEFAULT_ROWS, 0, 0, &[])
+            .await
+            .map_err(|e| ProtocolError::Channel(e.to_string()))?;
+        channel
+            .request_shell(true)
+            .await
+            .map_err(|e| ProtocolError::Channel(e.to_string()))?;
+        Ok(RusshSession {
+            conn: self,
+            channel,
+            closed: false,
+        })
+    }
+
+    /// Open an SFTP subsystem, consuming the connection.
+    pub async fn open_sftp(self) -> Result<RusshSftp> {
+        let channel = self.open_session_channel().await?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|e| ProtocolError::Channel(e.to_string()))?;
+        let session = russh_sftp::client::SftpSession::new(channel.into_stream())
+            .await
+            .map_err(|e| ProtocolError::Sftp(e.to_string()))?;
+        Ok(RusshSftp {
+            _conn: self,
+            session,
+        })
+    }
+
+    /// Open a `direct-tcpip` forwarding stream from the remote end to
+    /// `host:port`. Each call yields an independent stream; the tunnel driver
+    /// opens one per accepted local connection.
+    pub async fn open_forward_stream(&self, host: &str, port: u16) -> Result<DirectTcpipStream> {
+        let channel = self
+            .handle
+            .channel_open_direct_tcpip(host.to_string(), port as u32, "127.0.0.1", 0)
+            .await
+            .map_err(|e| ProtocolError::Channel(e.to_string()))?;
+        Ok(channel.into_stream())
+    }
+
+    /// Send a clean SSH disconnect (best-effort).
+    pub async fn disconnect(&self) {
+        let _ = self
+            .handle
+            .disconnect(Disconnect::ByApplication, "", "")
+            .await;
+    }
+}
+
+/// Validate a single-hop jump chain before opening any socket. Pure (unit-tested).
+pub fn validate_jump_chain(jump: &SshSettings, target: &SshSettings) -> Result<()> {
+    if jump.host.trim().is_empty() {
+        return Err(ProtocolError::Connect("jump host address is empty".into()));
+    }
+    if target.host.trim().is_empty() {
+        return Err(ProtocolError::Connect(
+            "target host address is empty".into(),
+        ));
+    }
+    // A gateway pointing at itself is a configuration mistake, not a chain.
+    if jump.host == target.host && jump.port == target.port {
+        return Err(ProtocolError::Connect(
+            "jump host and target are the same host:port".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// SSH connector backed by `russh`.
 #[derive(Default)]
 pub struct RusshConnector;
 
 impl RusshConnector {
-    /// Jump-host chaining: connect to the gateway, open a `direct-tcpip` channel
-    /// to the target, and run the target SSH session over that stream.
+    /// Connect to `target` through the gateway `jump`, returning a shell on the
+    /// **target** (not the gateway).
     ///
-    /// Not implemented yet. The primitive is `Handle::channel_open_direct_tcpip`
-    /// then `client::connect_stream` over `channel.into_stream()`; the same
-    /// channel type also backs the `rrs-tunnels` driver. Kept as an explicit
-    /// seam so the architecture stays open without shipping a fake.
-    async fn connect_via_jump_host(
+    /// This is the resolved-endpoints entry point: the caller (orchestration
+    /// layer / dev harness) supplies both fully-built profiles and their
+    /// transient credentials. The trait-level [`connect_shell`](Connector::connect_shell)
+    /// only receives one profile, so it cannot resolve the second hop's profile
+    /// and secret through the `Connector` boundary — it reports that and points
+    /// here instead.
+    pub async fn connect_shell_via_jump(
         &self,
-        _profile: &ConnectionProfile,
-        _creds: &ResolvedCredentials,
+        jump: &ConnectionProfile,
+        jump_creds: &ResolvedCredentials,
+        target: &ConnectionProfile,
+        target_creds: &ResolvedCredentials,
     ) -> Result<Box<dyn RemoteSession>> {
-        Err(ProtocolError::NotImplemented(
-            "SSH jump-host chaining (direct-tcpip) — see RusshConnector::connect_via_jump_host",
-        ))
+        let jump_ssh = ssh_settings(jump)?;
+        let target_ssh = ssh_settings(target)?;
+        let conn =
+            SshConnection::connect_via_jump_host(jump_ssh, jump_creds, target_ssh, target_creds)
+                .await?;
+        Ok(Box::new(conn.open_shell().await?))
     }
 }
 
@@ -202,28 +409,24 @@ impl Connector for RusshConnector {
     ) -> Result<Box<dyn RemoteSession>> {
         let ssh = ssh_settings(profile)?;
         if ssh.jump_host.is_some() {
-            return self.connect_via_jump_host(profile, creds).await;
+            // A jump host is referenced by another profile's id; resolving that
+            // profile (and its secret) needs the profile/credential stores,
+            // which the `Connector` trait deliberately does not expose. The
+            // orchestration layer must resolve both hops and call
+            // `connect_shell_via_jump`.
+            return Err(ProtocolError::NotImplemented(
+                "jump-host shell from a single profile — resolve both hops and call \
+                 RusshConnector::connect_shell_via_jump (the real chaining lives in \
+                 SshConnection::connect_via_jump_host)",
+            ));
         }
 
-        let handle = establish(ssh, creds).await?;
-        let channel = handle
-            .channel_open_session()
-            .await
-            .map_err(|e| ProtocolError::Channel(e.to_string()))?;
-        channel
-            .request_pty(false, DEFAULT_TERM, DEFAULT_COLS, DEFAULT_ROWS, 0, 0, &[])
-            .await
-            .map_err(|e| ProtocolError::Channel(e.to_string()))?;
-        channel
-            .request_shell(true)
-            .await
-            .map_err(|e| ProtocolError::Channel(e.to_string()))?;
-
-        Ok(Box::new(RusshSession {
-            _handle: handle,
-            channel,
-            closed: false,
-        }))
+        Ok(Box::new(
+            SshConnection::connect(ssh, creds)
+                .await?
+                .open_shell()
+                .await?,
+        ))
     }
 }
 
@@ -236,27 +439,6 @@ fn ssh_settings(profile: &ConnectionProfile) -> Result<&SshSettings> {
             other.kind()
         ))),
     }
-}
-
-/// Connect, verify the host key, and authenticate. Returns the live handle.
-async fn establish(
-    ssh: &SshSettings,
-    creds: &ResolvedCredentials,
-) -> Result<Handle<ClientHandler>> {
-    let config = Arc::new(client::Config::default());
-    let handler = ClientHandler {
-        host: ssh.host.clone(),
-        port: ssh.port,
-        strict: ssh.strict_host_key_checking,
-        hostkey_status: Arc::new(AtomicU8::new(HK_PENDING)),
-    };
-
-    let mut handle = client::connect(config, (ssh.host.clone(), ssh.port), handler)
-        .await
-        .map_err(|e| ProtocolError::Connect(e.to_string()))?;
-
-    authenticate(&mut handle, ssh, creds).await?;
-    Ok(handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -414,10 +596,11 @@ async fn try_agent_auth(handle: &mut Handle<ClientHandler>, user: &str) -> Resul
 // Interactive shell session
 // ---------------------------------------------------------------------------
 
-/// A live SSH shell exposed as a [`RemoteSession`]. Holds the connection handle
-/// (kept alive for the channel's lifetime) and the session channel.
+/// A live SSH shell exposed as a [`RemoteSession`]. Holds the connection
+/// (kept alive for the channel's lifetime, including any jump host) and the
+/// session channel.
 pub struct RusshSession {
-    _handle: Handle<ClientHandler>,
+    conn: SshConnection,
     channel: Channel<client::Msg>,
     closed: bool,
 }
@@ -460,10 +643,7 @@ impl RemoteSession for RusshSession {
         self.closed = true;
         let _ = self.channel.eof().await;
         let _ = self.channel.close().await;
-        let _ = self
-            ._handle
-            .disconnect(Disconnect::ByApplication, "", "")
-            .await;
+        self.conn.disconnect().await;
         Ok(())
     }
 }
@@ -474,35 +654,24 @@ impl RemoteSession for RusshSession {
 
 /// SFTP client over a russh connection. Construct with [`RusshSftp::connect`].
 pub struct RusshSftp {
-    _handle: Handle<ClientHandler>,
+    _conn: SshConnection,
     session: russh_sftp::client::SftpSession,
 }
 
 impl RusshSftp {
     /// Open an SFTP session for `profile` using transient `creds`.
+    ///
+    /// SFTP *through* a jump host is not wired up here yet (the primitive exists
+    /// via [`SshConnection::connect_via_jump_host`] + [`SshConnection::open_sftp`]).
     pub async fn connect(profile: &ConnectionProfile, creds: &ResolvedCredentials) -> Result<Self> {
         let ssh = ssh_settings(profile)?;
         if ssh.jump_host.is_some() {
             return Err(ProtocolError::NotImplemented(
-                "SFTP over a jump host (direct-tcpip) — see RusshConnector::connect_via_jump_host",
+                "SFTP over a jump host — resolve both hops and use \
+                 SshConnection::connect_via_jump_host(...).open_sftp()",
             ));
         }
-        let handle = establish(ssh, creds).await?;
-        let channel = handle
-            .channel_open_session()
-            .await
-            .map_err(|e| ProtocolError::Channel(e.to_string()))?;
-        channel
-            .request_subsystem(true, "sftp")
-            .await
-            .map_err(|e| ProtocolError::Channel(e.to_string()))?;
-        let session = russh_sftp::client::SftpSession::new(channel.into_stream())
-            .await
-            .map_err(|e| ProtocolError::Sftp(e.to_string()))?;
-        Ok(Self {
-            _handle: handle,
-            session,
-        })
+        SshConnection::connect(ssh, creds).await?.open_sftp().await
     }
 }
 
@@ -703,6 +872,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn jump_chain_validation() {
+        let jump = SshSettings {
+            host: "gw.example".into(),
+            port: 22,
+            ..SshSettings::default()
+        };
+        let target = SshSettings {
+            host: "10.0.0.5".into(),
+            port: 22,
+            ..SshSettings::default()
+        };
+
+        // Distinct, non-empty endpoints are fine.
+        assert!(validate_jump_chain(&jump, &target).is_ok());
+
+        // Empty target host is rejected.
+        let mut bad = target.clone();
+        bad.host = "  ".into();
+        assert!(validate_jump_chain(&jump, &bad).is_err());
+
+        // Empty jump host is rejected.
+        let mut bad_jump = jump.clone();
+        bad_jump.host = String::new();
+        assert!(validate_jump_chain(&bad_jump, &target).is_err());
+
+        // Jump == target (same host:port) is a config mistake.
+        assert!(validate_jump_chain(&jump, &jump).is_err());
+        // ...but the same host on a different port is allowed.
+        let mut other_port = jump.clone();
+        other_port.port = 2222;
+        assert!(validate_jump_chain(&jump, &other_port).is_ok());
+    }
+
     /// Live SFTP round-trip against a real sshd. Ignored by default (needs a
     /// server); run manually with publickey auth, e.g.:
     ///
@@ -750,5 +953,61 @@ mod tests {
         );
 
         sftp.remove_file(&path).await.expect("remove");
+    }
+
+    /// Live single-hop jump-host round-trip. Ignored by default (needs two
+    /// reachable sshd endpoints, where the *jump* host can reach the *target*).
+    /// Connects target-through-jump, opens a shell, and checks a command runs on
+    /// the target. Run with publickey auth, e.g.:
+    ///
+    /// ```text
+    /// NEXTERM_JUMP_TEST_HOST=gw.example   NEXTERM_JUMP_TEST_USER=$USER \
+    /// NEXTERM_JUMP_TEST_KEY=$HOME/.ssh/id_ed25519 \
+    /// NEXTERM_TARGET_TEST_HOST=10.0.0.5   NEXTERM_TARGET_TEST_USER=root \
+    /// NEXTERM_TARGET_TEST_KEY=$HOME/.ssh/id_ed25519 \
+    /// cargo test -p rrs-protocols --features ssh-russh -- --ignored jump_host_roundtrip
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires two reachable sshd endpoints; see doc comment"]
+    async fn jump_host_roundtrip() {
+        fn hop(prefix: &str) -> (SshSettings, ResolvedCredentials) {
+            let host = std::env::var(format!("{prefix}_HOST")).expect("HOST");
+            let user = std::env::var(format!("{prefix}_USER")).expect("USER");
+            let key = std::env::var(format!("{prefix}_KEY")).ok();
+            let ssh = SshSettings {
+                host,
+                username: user,
+                private_key_path: key,
+                strict_host_key_checking: false,
+                ..SshSettings::default()
+            };
+            (ssh, ResolvedCredentials::default())
+        }
+
+        let (jump_ssh, jump_creds) = hop("NEXTERM_JUMP_TEST");
+        let (target_ssh, target_creds) = hop("NEXTERM_TARGET_TEST");
+
+        let conn = SshConnection::connect_via_jump_host(
+            &jump_ssh,
+            &jump_creds,
+            &target_ssh,
+            &target_creds,
+        )
+        .await
+        .expect("jump connect");
+        let mut session = conn.open_shell().await.expect("open shell");
+
+        session.write(b"echo JUMP_OK\nexit\n").await.expect("write");
+        let mut out = Vec::new();
+        loop {
+            let chunk = session.read().await.expect("read");
+            if chunk.is_empty() {
+                break;
+            }
+            out.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("JUMP_OK"), "unexpected target output: {text}");
+        session.close().await.expect("close");
     }
 }

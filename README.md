@@ -27,7 +27,14 @@ SSH/Telnet/RDP/VNC/SFTP и т.д., менеджер туннелей, мульт
   рабочим mock-SSH, local-shell через PTY (флаг `local-pty`) и **реальным
   SSH/SFTP через `russh`** (флаг `ssh-russh`): PTY-shell, auth agent→key→
   password→keyboard-interactive, проверка `known_hosts`.
-- Менеджер SSH-туннелей (local/remote/dynamic) с mock-драйвером и тестами.
+- Менеджер SSH-туннелей (local/remote/dynamic) с mock-драйвером и тестами,
+  плюс **реальный драйвер local-forwarding (`ssh -L`) через `russh`** (флаг
+  `ssh-russh`): `direct-tcpip`-канал на каждое входящее соединение,
+  bidirectional-прокачка байт, корректный shutdown по `stop`/Ctrl-C. Remote
+  (`-R`) и dynamic SOCKS (`-D`) пока возвращают `Unsupported`.
+- **Single-hop jump-host (`ProxyJump`)**: подключение к target *через* gateway
+  по `direct-tcpip` — реальная вторая SSH-сессия поверх канала, не `ssh target`
+  внутри shell. Host-key и auth проверяются для обоих хостов независимо.
 - Рабочий HTTP-файловый мини-сервер (axum) и планировщик-мини-сервер.
 - Логика, не зависящая от GUI: мульти-ввод с защитой от опасных команд, макросы
   с предупреждением о секретах, детектор конфликтов при правке удалённых файлов,
@@ -126,6 +133,25 @@ cargo run -p rrs-cli --features ssh-russh -- ssh-connect \
 cargo run -p rrs-cli --features ssh-russh -- ssh-connect \
   --host 192.168.1.10 --user root --key ~/.ssh/id_ed25519
 
+# Jump-host: shell на target ЧЕРЕЗ gateway (direct-tcpip; нужна фича ssh-russh).
+# Пароли — из отдельных env-переменных (dev-only, не печатаются); ключи — на хоп.
+NEXTERM_JUMP_PASSWORD='gw-pw' NEXTERM_TARGET_PASSWORD='t-pw' \
+cargo run -p rrs-cli --features ssh-russh -- ssh-jump-connect \
+  --jump-host 192.168.1.10 --jump-user jumpuser \
+  --target-host 10.10.10.5 --target-user root \
+  --command 'echo JUMP_OK; hostname'
+# Или по ключам:
+cargo run -p rrs-cli --features ssh-russh -- ssh-jump-connect \
+  --jump-host gw --jump-user me --jump-key ~/.ssh/id_ed25519 \
+  --target-host 10.10.10.5 --target-user root --target-key ~/.ssh/id_ed25519
+
+# Local port-forward (ssh -L) до Ctrl-C (нужна фича ssh-russh):
+NEXTERM_SSH_PASSWORD='secret' \
+cargo run -p rrs-cli --features ssh-russh -- tunnel-local \
+  --ssh-host 127.0.0.1 --ssh-user test \
+  --bind 127.0.0.1:18080 --target 127.0.0.1:80
+# Теперь подключения на 127.0.0.1:18080 форвардятся через SSH-хост на target.
+
 # Подсветка строки вывода:
 cargo run -p rrs-cli -- highlight "iface eth0 is up at 10.0.0.1 error"
 
@@ -146,14 +172,34 @@ cargo test --workspace
 - `ssh-russh` — **реальный SSH/SFTP** через `russh` 0.61 + `russh-sftp` 2.3
   (крипто-бэкенд `ring`). Готово: PTY-shell как `RemoteSession`, SFTP
   (`RusshSftp`), аутентификация agent→key→password→keyboard-interactive,
-  проверка `known_hosts` с учётом `strict_host_key_checking`. Не готово:
-  jump-host (`direct-tcpip`) — возвращает `NotImplemented`.
+  проверка `known_hosts` с учётом `strict_host_key_checking`, **single-hop
+  jump-host (`direct-tcpip`)** и **реальный local-forwarding tunnel driver**.
+  Внутри — единый переиспользуемый примитив `SshConnection` (connect / connect
+  через jump / `open_shell` / `open_sftp` / `open_forward_stream`), без
+  копипасты auth/known_hosts.
   - Auth methods реально готовы: **agent, public key, password,
     keyboard-interactive**. Strict mode: неизвестный host-key → отказ;
     non-strict → подключение + warning; изменённый ключ → всегда отказ.
-  - `ssh-connect` читает пароль из env (`--password-env`, по умолчанию
-    `NEXTERM_SSH_PASSWORD`) — это **временный dev-харнесс**, не финальный UX:
-    в проде секрет лежит в OS-keyring и резолвится транзиентно.
+  - **Jump-host** (`ssh-jump-connect`): открывается `direct-tcpip` канал на
+    gateway к `target:port`, поверх него поднимается отдельная SSH-сессия к
+    target (host-key + auth проверяются для обоих хостов). Пользователь получает
+    shell на **target**. Пароли — из `NEXTERM_JUMP_PASSWORD` /
+    `NEXTERM_TARGET_PASSWORD` (dev-only, не печатаются); ключи — `--jump-key` /
+    `--target-key`. Ограничения: один gateway (цепочки длины > 1 — TODO), SFTP
+    через jump-host пока не подключён к `RusshSftp::connect`.
+  - **Tunnel driver** (`tunnel-local`): `RusshTunnelDriver` биндит локальный
+    listener и форвардит каждое соединение через `direct-tcpip` на
+    `target:port`. Поддержан **только local-forwarding (`-L`)**; remote (`-R`) и
+    dynamic SOCKS (`-D`) → `TunnelError::Unsupported`. Драйвер живёт в
+    `crates/tunnels` (фича `ssh-russh`, dep `rrs-protocols`); граф остаётся
+    однонаправленным `tunnels → protocols → core`.
+  - `ssh-connect`/`ssh-jump-connect`/`tunnel-local` читают пароли из env
+    (`--password-env` и аналоги) — это **временный dev-харнесс**, не финальный
+    UX: в проде секрет лежит в OS-keyring и резолвится транзиентно.
+  - Live-проверки `direct-tcpip` помечены `#[ignore]` и требуют sshd:
+    `jump_host_roundtrip` (`rrs-protocols`, env `NEXTERM_JUMP_TEST_*` +
+    `NEXTERM_TARGET_TEST_*`) и `local_tunnel_roundtrip` (`rrs-tunnels`, env
+    `NEXTERM_SSH_TEST_*`).
 - `pty` — локальный shell через PTY (`portable-pty`), в крейте `rrs-terminal`.
 - `local-pty` (на `rrs-cli`/`rrs-protocols`) — local-shell как полноценный транспорт
   через `AppCore::connect` (`LocalShellConnector`/`LocalPtySession`); тянет `pty`.
@@ -192,11 +238,13 @@ RUST_LOG=rrs_miniservers=debug,info cargo run -p rrs-cli -- serve-http
 - будущий Qt-фронтенд требует Qt6 + CMake/qmake.
 
 ## Дорожная карта
-- **v0.2:** реальный SSH+SFTP через `russh`; реальный PTY; SQLite-хранилище с
-  миграциями; Qt/QML-скелет (одно окно + вкладка поверх `AppCore`); реальное
-  форвардинг туннелей через каналы `russh`.
+- **v0.2:** реальный SSH+SFTP через `russh` ✓; реальный PTY ✓; single-hop
+  jump-host ✓; реальный local-forwarding tunnel driver ✓; SQLite-хранилище с
+  миграциями; Qt/QML-скелет (одно окно + вкладка поверх `AppCore`).
 - **v0.3:** полноценная SGR-aware подсветка; вендорные пресеты (Cisco/MikroTik/
-  …); цепочки jump-host; больше мини-серверов (TFTP/FTP/SSH); GTK-фронтенд.
+  …); **цепочки jump-host (длина > 1)**, SFTP через jump-host; **remote (`-R`) и
+  dynamic SOCKS (`-D`) туннели**; проброс SSH-агента; больше мини-серверов
+  (TFTP/FTP/SSH); GTK-фронтенд.
 - **Долгосрочно:** RDP (IronRDP) и VNC; обёртки X-сервера (Xephyr/Xvfb/Xwayland,
   без переписывания Xorg); серверы NFS/Telnet/VNC; интеграция с systemd
   (user-services); поддержка Windows (backend Windows Credential Manager за тем

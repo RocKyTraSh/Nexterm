@@ -85,6 +85,76 @@ enum Command {
         #[arg(long)]
         insecure: bool,
     },
+    /// Connect to a target host *through* a jump host and run one command
+    /// (needs `--features ssh-russh`).
+    ///
+    /// Opens a real `direct-tcpip` channel on the gateway and runs a full SSH
+    /// session to the target over it — you get a shell on the **target**, not
+    /// the gateway. Passwords come from env vars (dev-only) and are never
+    /// printed; keys are supported per hop.
+    #[cfg(feature = "ssh-russh")]
+    SshJumpConnect {
+        #[arg(long)]
+        jump_host: String,
+        #[arg(long, default_value_t = 22)]
+        jump_port: u16,
+        #[arg(long)]
+        jump_user: String,
+        /// Private key for the jump host (publickey auth).
+        #[arg(long)]
+        jump_key: Option<String>,
+        /// Env var holding the jump host password (dev-only).
+        #[arg(long, default_value = "NEXTERM_JUMP_PASSWORD")]
+        jump_password_env: String,
+        #[arg(long)]
+        target_host: String,
+        #[arg(long, default_value_t = 22)]
+        target_port: u16,
+        #[arg(long)]
+        target_user: String,
+        /// Private key for the target host (publickey auth).
+        #[arg(long)]
+        target_key: Option<String>,
+        /// Env var holding the target password (dev-only).
+        #[arg(long, default_value = "NEXTERM_TARGET_PASSWORD")]
+        target_password_env: String,
+        /// Command to run on the target; defaults to a harmless probe.
+        #[arg(long)]
+        command: Option<String>,
+        /// Disable known_hosts checking for both hops (accept unknown keys).
+        #[arg(long)]
+        insecure: bool,
+    },
+    /// Run an SSH local port-forward (`ssh -L`) until Ctrl-C
+    /// (needs `--features ssh-russh`).
+    ///
+    /// Binds a local listener and forwards every connection to `--target`
+    /// through a `direct-tcpip` channel on the SSH connection. The password
+    /// comes from an env var (dev-only) and is never printed.
+    #[cfg(feature = "ssh-russh")]
+    TunnelLocal {
+        #[arg(long)]
+        ssh_host: String,
+        #[arg(long, default_value_t = 22)]
+        ssh_port: u16,
+        #[arg(long)]
+        ssh_user: String,
+        /// Private key for the SSH connection (publickey auth).
+        #[arg(long)]
+        ssh_key: Option<String>,
+        /// Env var holding the SSH password (dev-only).
+        #[arg(long, default_value = "NEXTERM_SSH_PASSWORD")]
+        password_env: String,
+        /// Local address to bind, `host:port` (e.g. 127.0.0.1:18080).
+        #[arg(long, default_value = "127.0.0.1:18080")]
+        bind: String,
+        /// Destination reached from the SSH host, `host:port` (e.g. 127.0.0.1:80).
+        #[arg(long)]
+        target: String,
+        /// Disable known_hosts checking (accept unknown host keys).
+        #[arg(long)]
+        insecure: bool,
+    },
     /// Show highlight spans for a line of text.
     Highlight { text: String },
     /// Check a command against the multi-exec danger rules.
@@ -129,6 +199,60 @@ async fn main() -> anyhow::Result<()> {
             password_env,
             insecure,
         } => cmd_ssh_connect(host, port, user, command, key, password_env, insecure).await,
+        #[cfg(feature = "ssh-russh")]
+        Command::SshJumpConnect {
+            jump_host,
+            jump_port,
+            jump_user,
+            jump_key,
+            jump_password_env,
+            target_host,
+            target_port,
+            target_user,
+            target_key,
+            target_password_env,
+            command,
+            insecure,
+        } => {
+            cmd_ssh_jump_connect(JumpArgs {
+                jump_host,
+                jump_port,
+                jump_user,
+                jump_key,
+                jump_password_env,
+                target_host,
+                target_port,
+                target_user,
+                target_key,
+                target_password_env,
+                command,
+                insecure,
+            })
+            .await
+        }
+        #[cfg(feature = "ssh-russh")]
+        Command::TunnelLocal {
+            ssh_host,
+            ssh_port,
+            ssh_user,
+            ssh_key,
+            password_env,
+            bind,
+            target,
+            insecure,
+        } => {
+            cmd_tunnel_local(
+                ssh_host,
+                ssh_port,
+                ssh_user,
+                ssh_key,
+                password_env,
+                bind,
+                target,
+                insecure,
+            )
+            .await
+        }
         Command::Highlight { text } => cmd_highlight(text),
         Command::DangerCheck { command } => cmd_danger_check(command),
     }
@@ -300,6 +424,188 @@ async fn cmd_ssh_connect(
     }
     session.close().await?;
     println!("\n(ssh-connect complete)");
+    Ok(())
+}
+
+/// Grouped args for the jump-connect command (keeps the signature readable).
+#[cfg(feature = "ssh-russh")]
+struct JumpArgs {
+    jump_host: String,
+    jump_port: u16,
+    jump_user: String,
+    jump_key: Option<String>,
+    jump_password_env: String,
+    target_host: String,
+    target_port: u16,
+    target_user: String,
+    target_key: Option<String>,
+    target_password_env: String,
+    command: Option<String>,
+    insecure: bool,
+}
+
+/// Build an SSH profile for one hop from CLI flags.
+#[cfg(feature = "ssh-russh")]
+fn ssh_profile(
+    name: &str,
+    host: &str,
+    port: u16,
+    user: &str,
+    key: Option<String>,
+    strict: bool,
+) -> ConnectionProfile {
+    use rrs_core::model::ProtocolSettings;
+    let mut profile = ConnectionProfile::new_ssh(name, host, user);
+    if let ProtocolSettings::Ssh(s) = &mut profile.settings {
+        s.port = port;
+        s.private_key_path = key;
+        s.strict_host_key_checking = strict;
+    }
+    profile
+}
+
+/// Read a dev-only password from `password_env` into transient credentials. The
+/// value is never printed; an unset/empty var yields no password (key/agent
+/// auth still apply).
+#[cfg(feature = "ssh-russh")]
+fn creds_from_env(password_env: &str) -> rrs_protocols::ResolvedCredentials {
+    use rrs_credentials::Secret;
+    let mut creds = rrs_protocols::ResolvedCredentials::default();
+    if let Ok(pw) = std::env::var(password_env) {
+        if !pw.is_empty() {
+            creds.password = Some(Secret::new(pw));
+        }
+    }
+    creds
+}
+
+/// Split a `host:port` string (splits on the last colon, so bare IPv4/hostnames
+/// work; IPv6 literals would need brackets — out of scope for this dev harness).
+#[cfg(feature = "ssh-russh")]
+fn split_host_port(s: &str) -> anyhow::Result<(String, u16)> {
+    let (host, port) = s
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("expected host:port, got `{s}`"))?;
+    if host.is_empty() {
+        return Err(anyhow::anyhow!("empty host in `{s}`"));
+    }
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("invalid port in `{s}`"))?;
+    Ok((host.to_string(), port))
+}
+
+#[cfg(feature = "ssh-russh")]
+async fn cmd_ssh_jump_connect(a: JumpArgs) -> anyhow::Result<()> {
+    use rrs_protocols::RusshConnector;
+
+    let strict = !a.insecure;
+    let jump = ssh_profile(
+        "jump",
+        &a.jump_host,
+        a.jump_port,
+        &a.jump_user,
+        a.jump_key,
+        strict,
+    );
+    let target = ssh_profile(
+        "target",
+        &a.target_host,
+        a.target_port,
+        &a.target_user,
+        a.target_key,
+        strict,
+    );
+    let jump_creds = creds_from_env(&a.jump_password_env);
+    let target_creds = creds_from_env(&a.target_password_env);
+
+    println!(
+        "connecting to {}:{} via jump host {}:{} ...",
+        a.target_host, a.target_port, a.jump_host, a.jump_port
+    );
+    let connector = RusshConnector;
+    let mut session = connector
+        .connect_shell_via_jump(&jump, &jump_creds, &target, &target_creds)
+        .await
+        .context("jump connect")?;
+    println!("connected to target through the jump host");
+
+    let cmd = a
+        .command
+        .unwrap_or_else(|| "echo JUMP_OK; hostname".to_string());
+    session.write(format!("{cmd}\nexit\n").as_bytes()).await?;
+    loop {
+        let chunk = session.read().await?;
+        if chunk.is_empty() {
+            break;
+        }
+        print!("{}", String::from_utf8_lossy(&chunk));
+    }
+    session.close().await?;
+    println!("\n(ssh-jump-connect complete)");
+    Ok(())
+}
+
+#[cfg(feature = "ssh-russh")]
+#[allow(clippy::too_many_arguments)]
+async fn cmd_tunnel_local(
+    ssh_host: String,
+    ssh_port: u16,
+    ssh_user: String,
+    ssh_key: Option<String>,
+    password_env: String,
+    bind: String,
+    target: String,
+    insecure: bool,
+) -> anyhow::Result<()> {
+    use rrs_core::model::SshSettings;
+    use rrs_tunnels::{RusshTunnelDriver, TunnelManager, TunnelSpec};
+    use uuid::Uuid;
+
+    let (bind_addr, bind_port) = split_host_port(&bind).context("parsing --bind")?;
+    let (target_host, target_port) = split_host_port(&target).context("parsing --target")?;
+
+    let ssh = SshSettings {
+        host: ssh_host.clone(),
+        port: ssh_port,
+        username: ssh_user,
+        private_key_path: ssh_key,
+        strict_host_key_checking: !insecure,
+        ..SshSettings::default()
+    };
+    let creds = creds_from_env(&password_env);
+
+    println!("establishing SSH connection to {ssh_host}:{ssh_port} ...");
+    let driver = RusshTunnelDriver::connect(&ssh, &creds)
+        .await
+        .map_err(|e| anyhow::anyhow!("ssh connect for tunnel: {e}"))?;
+    let mut mgr = TunnelManager::new(Box::new(driver));
+
+    let mut spec = TunnelSpec::new_local(
+        "cli-local",
+        Uuid::new_v4(),
+        bind_port,
+        target_host.clone(),
+        target_port,
+    );
+    spec.bind_address = bind_addr.clone();
+    let id = mgr.add(spec);
+    mgr.start(id)
+        .await
+        .map_err(|e| anyhow::anyhow!("starting tunnel: {e}"))?;
+
+    println!("local forward running:");
+    println!("  bind   : {bind_addr}:{bind_port}");
+    println!("  target : {target_host}:{target_port}  (reached from {ssh_host})");
+    println!("Press Ctrl-C to stop.");
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for ctrl-c")?;
+
+    mgr.stop(id)
+        .await
+        .map_err(|e| anyhow::anyhow!("stopping tunnel: {e}"))?;
+    println!("tunnel stopped.");
     Ok(())
 }
 

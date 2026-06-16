@@ -12,7 +12,8 @@ path = "src/main.rs"
 default = []
 # Forward optional backends so a single CLI binary can exercise them.
 keyring-os = ["rrs-credentials/keyring-os"]
-ssh-russh = ["rrs-protocols/ssh-russh"]
+# Real SSH plus the russh-backed tunnel driver (jump-host + local forwarding).
+ssh-russh = ["rrs-protocols/ssh-russh", "rrs-tunnels/ssh-russh"]
 pty = ["rrs-terminal/pty"]
 # PTY-backed local-shell transport reachable through AppCore::connect.
 local-pty = ["rrs-protocols/local-pty"]
@@ -22,6 +23,7 @@ rrs-core = { workspace = true }
 rrs-credentials = { workspace = true }
 rrs-protocols = { workspace = true }
 rrs-terminal = { workspace = true }
+rrs-tunnels = { workspace = true }
 rrs-miniservers = { workspace = true }
 rrs-platform = { workspace = true }
 rrs-ui-common = { workspace = true }
