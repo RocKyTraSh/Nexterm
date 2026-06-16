@@ -81,6 +81,10 @@ enum Command {
         /// Env var holding the password (dev-only).
         #[arg(long, default_value = "NEXTERM_SSH_PASSWORD")]
         password_env: String,
+        /// Env var holding the private key's passphrase, if the key is encrypted
+        /// (dev-only; separate from the password).
+        #[arg(long)]
+        key_passphrase_env: Option<String>,
         /// Disable known_hosts checking (accept unknown host keys).
         #[arg(long)]
         insecure: bool,
@@ -268,6 +272,10 @@ enum Command {
         /// Env var holding the password (dev-only).
         #[arg(long, default_value = "NEXTERM_SSH_PASSWORD")]
         password_env: String,
+        /// Env var holding the private key's passphrase, if the key is encrypted
+        /// (dev-only; separate from the password).
+        #[arg(long)]
+        key_passphrase_env: Option<String>,
         /// Remote directory to list.
         #[arg(long, default_value = "/")]
         path: String,
@@ -332,6 +340,10 @@ enum Command {
         /// Shared private key applied to every hop (publickey auth).
         #[arg(long)]
         key: Option<String>,
+        /// Env var holding the shared key passphrase for every hop's encrypted
+        /// `--key` (dev-only; separate from passwords).
+        #[arg(long)]
+        key_passphrase_env: Option<String>,
         /// Command to run on the target; defaults to a harmless probe.
         #[arg(long)]
         command: Option<String>,
@@ -405,6 +417,7 @@ async fn main() -> anyhow::Result<()> {
             command,
             key,
             password_env,
+            key_passphrase_env,
             insecure,
             agent_forwarding,
         } => {
@@ -415,6 +428,7 @@ async fn main() -> anyhow::Result<()> {
                 command,
                 key,
                 password_env,
+                key_passphrase_env,
                 insecure,
                 agent_forwarding,
             )
@@ -536,9 +550,22 @@ async fn main() -> anyhow::Result<()> {
             user,
             key,
             password_env,
+            key_passphrase_env,
             path,
             insecure,
-        } => cmd_sftp_ls(host, port, user, key, password_env, path, insecure).await,
+        } => {
+            cmd_sftp_ls(
+                host,
+                port,
+                user,
+                key,
+                password_env,
+                key_passphrase_env,
+                path,
+                insecure,
+            )
+            .await
+        }
         #[cfg(feature = "ssh-russh")]
         Command::SftpJumpLs {
             jump_host,
@@ -575,10 +602,22 @@ async fn main() -> anyhow::Result<()> {
             jumps,
             target,
             key,
+            key_passphrase_env,
             command,
             insecure,
             agent_forwarding,
-        } => cmd_ssh_chain_connect(jumps, target, key, command, insecure, agent_forwarding).await,
+        } => {
+            cmd_ssh_chain_connect(
+                jumps,
+                target,
+                key,
+                key_passphrase_env,
+                command,
+                insecure,
+                agent_forwarding,
+            )
+            .await
+        }
         #[cfg(feature = "ssh-russh")]
         Command::SftpChainLs {
             jumps,
@@ -717,6 +756,7 @@ async fn cmd_ssh_connect(
     command: Option<String>,
     key: Option<String>,
     password_env: String,
+    key_passphrase_env: Option<String>,
     insecure: bool,
     agent_forwarding: bool,
 ) -> anyhow::Result<()> {
@@ -743,6 +783,19 @@ async fn cmd_ssh_connect(
         if !pw.is_empty() {
             profile.credential = Some(CredentialRef::new("ssh-connect-cli"));
             core.set_profile_secret(&profile, Secret::new(pw)).await?;
+        }
+    }
+    // Same flow for the private-key passphrase: a SEPARATE credential ref so the
+    // password and the passphrase are stored and resolved independently.
+    if let Some(env) = key_passphrase_env {
+        if let Ok(pp) = std::env::var(&env) {
+            if !pp.is_empty() {
+                if let ProtocolSettings::Ssh(s) = &mut profile.settings {
+                    s.key_passphrase = Some(CredentialRef::new("ssh-connect-cli-passphrase"));
+                }
+                core.set_profile_key_passphrase(&profile, Secret::new(pp))
+                    .await?;
+            }
         }
     }
 
@@ -814,6 +867,26 @@ fn creds_from_env(password_env: &str) -> rrs_protocols::ResolvedCredentials {
     if let Ok(pw) = std::env::var(password_env) {
         if !pw.is_empty() {
             creds.password = Some(Secret::new(pw));
+        }
+    }
+    creds
+}
+
+/// Like [`creds_from_env`], plus a separate **private-key passphrase** read from
+/// `key_passphrase_env` (when provided). Password and passphrase stay in their
+/// own fields — never mixed. Neither value is printed.
+#[cfg(feature = "ssh-russh")]
+fn creds_from_envs(
+    password_env: &str,
+    key_passphrase_env: Option<&str>,
+) -> rrs_protocols::ResolvedCredentials {
+    use rrs_credentials::Secret;
+    let mut creds = creds_from_env(password_env);
+    if let Some(env) = key_passphrase_env {
+        if let Ok(pp) = std::env::var(env) {
+            if !pp.is_empty() {
+                creds.key_passphrase = Some(Secret::new(pp));
+            }
         }
     }
     creds
@@ -1182,13 +1255,14 @@ async fn cmd_sftp_ls(
     user: String,
     key: Option<String>,
     password_env: String,
+    key_passphrase_env: Option<String>,
     path: String,
     insecure: bool,
 ) -> anyhow::Result<()> {
     use rrs_protocols::{RusshSftp, SftpClient};
 
     let profile = ssh_profile("sftp", &host, port, &user, key, !insecure, false);
-    let creds = creds_from_env(&password_env);
+    let creds = creds_from_envs(&password_env, key_passphrase_env.as_deref());
 
     println!("opening SFTP to {host}:{port} ...");
     let sftp = RusshSftp::connect(&profile, &creds)
@@ -1285,12 +1359,15 @@ type ResolvedChain = (
 
 /// Build an ordered gateway chain + target from CLI hop specs. Per-hop passwords
 /// come from `NEXTERM_JUMP<i>_PASSWORD` (1-based) and `NEXTERM_TARGET_PASSWORD`;
-/// `key` (if any) is shared across all hops. Secrets are never printed.
+/// `key` (if any) is shared across all hops, and so is `key_passphrase_env` —
+/// the shared private key's passphrase applies to every hop (dev-only). Secrets
+/// are never printed.
 #[cfg(feature = "ssh-russh")]
 fn build_chain(
     jumps: &[String],
     target: &str,
     key: Option<String>,
+    key_passphrase_env: Option<&str>,
     insecure: bool,
     agent_forwarding: bool,
 ) -> anyhow::Result<ResolvedChain> {
@@ -1308,28 +1385,36 @@ fn build_chain(
             strict,
             false,
         );
-        let creds = creds_from_env(&jump_password_env(i));
+        let creds = creds_from_envs(&jump_password_env(i), key_passphrase_env);
         gateways.push((profile, creds));
     }
     let (thost, tuser) = parse_hop(target)?;
     let target_profile = ssh_profile("target", &thost, 22, &tuser, key, strict, agent_forwarding);
-    let target_creds = creds_from_env("NEXTERM_TARGET_PASSWORD");
+    let target_creds = creds_from_envs("NEXTERM_TARGET_PASSWORD", key_passphrase_env);
     Ok((gateways, target_profile, target_creds))
 }
 
 #[cfg(feature = "ssh-russh")]
+#[allow(clippy::too_many_arguments)]
 async fn cmd_ssh_chain_connect(
     jumps: Vec<String>,
     target: String,
     key: Option<String>,
+    key_passphrase_env: Option<String>,
     command: Option<String>,
     insecure: bool,
     agent_forwarding: bool,
 ) -> anyhow::Result<()> {
     use rrs_protocols::{Connector, JumpHop, RusshConnector};
 
-    let (gateways, target_profile, target_creds) =
-        build_chain(&jumps, &target, key, insecure, agent_forwarding)?;
+    let (gateways, target_profile, target_creds) = build_chain(
+        &jumps,
+        &target,
+        key,
+        key_passphrase_env.as_deref(),
+        insecure,
+        agent_forwarding,
+    )?;
     let hops: Vec<JumpHop<'_>> = gateways.iter().map(|(p, c)| JumpHop::new(p, c)).collect();
 
     println!(
@@ -1367,9 +1452,10 @@ async fn cmd_sftp_chain_ls(
 ) -> anyhow::Result<()> {
     use rrs_protocols::{Connector, JumpHop, RusshConnector};
 
-    // SFTP does not need agent forwarding.
+    // SFTP does not need agent forwarding; no shared key passphrase here
+    // (sftp-chain-ls keeps its arg list small — use ssh-chain-connect for that).
     let (gateways, target_profile, target_creds) =
-        build_chain(&jumps, &target, key, insecure, false)?;
+        build_chain(&jumps, &target, key, None, insecure, false)?;
     let hops: Vec<JumpHop<'_>> = gateways.iter().map(|(p, c)| JumpHop::new(p, c)).collect();
 
     println!(

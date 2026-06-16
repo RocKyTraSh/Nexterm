@@ -50,7 +50,9 @@
       "Bash(git fetch *)",
       "Bash(git push *)",
       "Bash(./target/debug/rrs tunnel-remote-chain *)",
-      "Bash(grep -iE \"\\\\.env|\\\\.pem|id_rsa|id_ed25519|\\\\.key$|secret|token|\\\\.pfx|core\\\\.|target/\")"
+      "Bash(grep -iE \"\\\\.env|\\\\.pem|id_rsa|id_ed25519|\\\\.key$|secret|token|\\\\.pfx|core\\\\.|target/\")",
+      "Bash(git pull *)",
+      "Bash(echo \"ok-lines: $\\(cargo test --workspace 2>&1)"
     ]
   }
 }

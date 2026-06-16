@@ -16,7 +16,7 @@ use uuid::Uuid;
 use rrs_core::config::AppConfig;
 use rrs_core::event::EventBus;
 use rrs_core::model::{
-    ConnectionProfile, ProtocolKind, ProtocolSettings, RuntimeSession, SessionState,
+    ConnectionProfile, CredentialRef, ProtocolKind, ProtocolSettings, RuntimeSession, SessionState,
 };
 use rrs_core::registry::SessionRegistry;
 use rrs_core::store::{FileProfileStore, ProfileStore};
@@ -102,20 +102,46 @@ impl AppCore {
         Arc::clone(&self.profiles)
     }
 
-    /// Resolve a profile's secret from the credential store (transiently).
+    /// Fetch the secret behind a credential ref, transiently.
     ///
-    /// The returned [`ResolvedCredentials`] holds zero-on-drop secrets and is
-    /// meant to be passed straight into a connector, never stored or logged.
+    /// A dangling reference — the profile names a credential the secret store
+    /// doesn't have — is a configuration error, surfaced clearly (never logged
+    /// with the secret, because there is none to log).
+    async fn resolve_ref(&self, cref: &CredentialRef) -> anyhow::Result<Secret> {
+        self.credentials
+            .get_secret(cref.id)
+            .await
+            .with_context(|| format!("reading secret for credential '{}'", cref.label))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "credential '{}' ({}) is referenced by the profile but is not in the \
+                     secret store",
+                    cref.label,
+                    cref.id
+                )
+            })
+    }
+
+    /// Resolve a profile's secrets from the credential store (transiently).
+    ///
+    /// Resolves the **password** (the profile-level [`ConnectionProfile::credential`])
+    /// and, for SSH, the **private-key passphrase** ([`SshSettings::key_passphrase`])
+    /// into two *independent* fields — they are never mixed. The returned
+    /// [`ResolvedCredentials`] holds zero-on-drop secrets and is meant to be
+    /// passed straight into a connector, never stored or logged.
     async fn resolve_credentials(
         &self,
         profile: &ConnectionProfile,
     ) -> anyhow::Result<ResolvedCredentials> {
         let mut resolved = ResolvedCredentials::default();
+        // Password: the profile-level credential reference.
         if let Some(cref) = &profile.credential {
-            if let Some(secret) = self.credentials.get_secret(cref.id).await? {
-                // For SSH we treat the stored secret as the password by default;
-                // key passphrases use a separate ref in a later iteration.
-                resolved.password = Some(secret);
+            resolved.password = Some(self.resolve_ref(cref).await?);
+        }
+        // Private-key passphrase: the SSH-specific reference (independent secret).
+        if let ProtocolSettings::Ssh(s) = &profile.settings {
+            if let Some(cref) = &s.key_passphrase {
+                resolved.key_passphrase = Some(self.resolve_ref(cref).await?);
             }
         }
         Ok(resolved)
@@ -269,7 +295,7 @@ impl AppCore {
         Ok((gateways, target_creds))
     }
 
-    /// Store a secret for a profile's credential reference.
+    /// Store the **password** secret for a profile's credential reference.
     pub async fn set_profile_secret(
         &self,
         profile: &ConnectionProfile,
@@ -279,6 +305,22 @@ impl AppCore {
             .credential
             .as_ref()
             .context("profile has no credential reference")?;
+        self.credentials.set_secret(cref.id, &secret).await?;
+        Ok(())
+    }
+
+    /// Store the **private-key passphrase** secret for an SSH profile's
+    /// `key_passphrase` credential reference (set the ref on the profile first).
+    pub async fn set_profile_key_passphrase(
+        &self,
+        profile: &ConnectionProfile,
+        secret: Secret,
+    ) -> anyhow::Result<()> {
+        let cref = match &profile.settings {
+            ProtocolSettings::Ssh(s) => s.key_passphrase.as_ref(),
+            _ => None,
+        }
+        .context("profile has no key-passphrase credential reference")?;
         self.credentials.set_secret(cref.id, &secret).await?;
         Ok(())
     }
@@ -648,5 +690,160 @@ mod tests {
         assert_eq!(ssh_jump_host(&local), None);
         // Sanity: a default SshSettings has no jump host.
         assert!(SshSettings::default().jump_host.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Credential resolution: password vs key passphrase (independent secrets)
+    // -----------------------------------------------------------------------
+
+    fn core_with_store(profiles: MemProfileStore) -> (AppCore, Arc<MemoryCredentialStore>) {
+        let store = Arc::new(MemoryCredentialStore::new());
+        let creds: Arc<dyn CredentialStore> = store.clone();
+        let core = AppCore::new(
+            AppConfig::default(),
+            Arc::new(profiles),
+            creds,
+            Arc::new(SpyConnector::default()),
+        );
+        (core, store)
+    }
+
+    fn with_password_ref(mut p: ConnectionProfile, cref: CredentialRef) -> ConnectionProfile {
+        p.credential = Some(cref);
+        p
+    }
+
+    fn with_passphrase_ref(mut p: ConnectionProfile, cref: CredentialRef) -> ConnectionProfile {
+        if let ProtocolSettings::Ssh(s) = &mut p.settings {
+            s.key_passphrase = Some(cref);
+        }
+        p
+    }
+
+    #[tokio::test]
+    async fn resolves_password_only() {
+        let (core, store) = core_with_store(MemProfileStore::default());
+        let pw = CredentialRef::new("pw");
+        store
+            .set_secret(pw.id, &Secret::new("hunter2"))
+            .await
+            .unwrap();
+        let profile = with_password_ref(ssh("p"), pw);
+
+        let creds = core.resolve_credentials(&profile).await.unwrap();
+        assert_eq!(creds.password.as_ref().map(|s| s.expose()), Some("hunter2"));
+        assert!(creds.key_passphrase.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolves_key_passphrase_only() {
+        let (core, store) = core_with_store(MemProfileStore::default());
+        let pp = CredentialRef::new("pp");
+        store
+            .set_secret(pp.id, &Secret::new("topsecret"))
+            .await
+            .unwrap();
+        let profile = with_passphrase_ref(ssh("p"), pp);
+
+        let creds = core.resolve_credentials(&profile).await.unwrap();
+        assert!(creds.password.is_none());
+        assert_eq!(
+            creds.key_passphrase.as_ref().map(|s| s.expose()),
+            Some("topsecret")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_both_without_mixing() {
+        let (core, store) = core_with_store(MemProfileStore::default());
+        let pw = CredentialRef::new("pw");
+        let pp = CredentialRef::new("pp");
+        store
+            .set_secret(pw.id, &Secret::new("the-password"))
+            .await
+            .unwrap();
+        store
+            .set_secret(pp.id, &Secret::new("the-passphrase"))
+            .await
+            .unwrap();
+        let profile = with_passphrase_ref(with_password_ref(ssh("p"), pw), pp);
+
+        let creds = core.resolve_credentials(&profile).await.unwrap();
+        assert_eq!(
+            creds.password.as_ref().map(|s| s.expose()),
+            Some("the-password")
+        );
+        assert_eq!(
+            creds.key_passphrase.as_ref().map(|s| s.expose()),
+            Some("the-passphrase")
+        );
+    }
+
+    #[tokio::test]
+    async fn old_profile_without_refs_resolves_to_none() {
+        let (core, _store) = core_with_store(MemProfileStore::default());
+        let creds = core.resolve_credentials(&ssh("plain")).await.unwrap();
+        assert!(creds.password.is_none());
+        assert!(creds.key_passphrase.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_password_secret_is_clean_error() {
+        let (core, _store) = core_with_store(MemProfileStore::default());
+        // Ref present, but nothing stored under it.
+        let profile = with_password_ref(ssh("p"), CredentialRef::new("pw"));
+        let err = core
+            .resolve_credentials(&profile)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not in the"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn missing_key_passphrase_secret_is_clean_error() {
+        let (core, _store) = core_with_store(MemProfileStore::default());
+        let profile = with_passphrase_ref(ssh("p"), CredentialRef::new("pp"));
+        let err = core
+            .resolve_credentials(&profile)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not in the"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn jump_chain_resolves_per_hop_key_passphrase() {
+        // gateway and target each have their own encrypted key (distinct
+        // passphrase secrets); the chain resolution keeps them per-hop.
+        let gw_pp = CredentialRef::new("gw-pp");
+        let target_pp = CredentialRef::new("target-pp");
+
+        let gw = with_passphrase_ref(ssh("gw1"), gw_pp.clone());
+        let target = with_passphrase_ref(with_jump(ssh("target"), gw.id), target_pp.clone());
+
+        let (core, store) = core_with_store(MemProfileStore::with(vec![gw]));
+        store
+            .set_secret(gw_pp.id, &Secret::new("gw-secret"))
+            .await
+            .unwrap();
+        store
+            .set_secret(target_pp.id, &Secret::new("target-secret"))
+            .await
+            .unwrap();
+
+        let (gateways, target_creds) = core.resolve_jump_chain(&target).await.unwrap();
+        assert_eq!(gateways.len(), 1);
+        assert_eq!(
+            gateways[0].1.key_passphrase.as_ref().map(|s| s.expose()),
+            Some("gw-secret")
+        );
+        assert_eq!(
+            target_creds.key_passphrase.as_ref().map(|s| s.expose()),
+            Some("target-secret")
+        );
+        // Passwords stay None (no password refs set).
+        assert!(gateways[0].1.password.is_none());
+        assert!(target_creds.password.is_none());
     }
 }

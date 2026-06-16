@@ -144,6 +144,23 @@ cargo run -p rrs-cli --features ssh-russh -- ssh-connect \
 cargo run -p rrs-cli --features ssh-russh -- ssh-connect \
   --host 192.168.1.10 --user root --key ~/.ssh/id_ed25519
 
+# Зашифрованный private key: passphrase — из ОТДЕЛЬНОЙ env (не из password!):
+NEXTERM_SSH_KEY_PASSPHRASE='secret' \
+cargo run -p rrs-cli --features ssh-russh -- ssh-connect \
+  --host SERVER --user USER --key ~/.ssh/id_ed25519_encrypted \
+  --key-passphrase-env NEXTERM_SSH_KEY_PASSPHRASE \
+  --command 'echo KEY_OK; whoami'
+# То же для SFTP:
+NEXTERM_SSH_KEY_PASSPHRASE='secret' \
+cargo run -p rrs-cli --features ssh-russh -- sftp-ls \
+  --host SERVER --user USER --key ~/.ssh/id_ed25519_encrypted \
+  --key-passphrase-env NEXTERM_SSH_KEY_PASSPHRASE --path /etc
+# Через chain (общий ключ + общая passphrase на все хопы, dev-only):
+NEXTERM_JUMP1_PASSWORD='' NEXTERM_TARGET_PASSWORD='' NEXTERM_SSH_KEY_PASSPHRASE='secret' \
+cargo run -p rrs-cli --features ssh-russh -- ssh-chain-connect \
+  --jump gw1:user1 --target target:user2 --key ~/.ssh/id_ed25519_encrypted \
+  --key-passphrase-env NEXTERM_SSH_KEY_PASSPHRASE --command 'echo CHAIN_KEY_OK'
+
 # SSH agent forwarding (выключено по умолчанию; нужен запущенный агент):
 #   eval "$(ssh-agent)"; ssh-add ~/.ssh/id_ed25519
 cargo run -p rrs-cli --features ssh-russh -- ssh-connect \
@@ -264,6 +281,21 @@ cargo test --workspace
   - Auth methods реально готовы: **agent, public key, password,
     keyboard-interactive**. Strict mode: неизвестный host-key → отказ;
     non-strict → подключение + warning; изменённый ключ → всегда отказ.
+  - **Раздельные credentials** (password vs key-passphrase). У SSH-профиля
+    независимо: **password** (ref `ConnectionProfile.credential`), **private key
+    path** (`SshSettings.private_key_path`), **private key passphrase** (ref
+    `SshSettings.key_passphrase` — отдельный `CredentialRef`, добавлен в этой
+    итерации), **agent** и **keyboard-interactive**. Резолв (`AppCore`) тянет
+    password и passphrase в **разные** поля `ResolvedCredentials` и НЕ смешивает
+    их: `password`/`keyboard-interactive` используют только password,
+    `load_secret_key` — только passphrase. Dangling ref (есть ссылка, нет секрета
+    в сторе) → понятная ошибка. **Passphrase НЕ хранится в профиле** — только
+    `CredentialRef` (UUID + метка); сам секрет в OS-keyring (или памяти) и
+    резолвится транзиентно. CLI dev-harness берёт passphrase из env
+    (`--key-passphrase-env`); финальный GUI будет сохранять её в keyring через
+    `CredentialStore`. (Замечание: копия passphrase в `String` для API russh
+    `load_secret_key` транзиентна, не логируется, но рвёт zeroize для копии — как
+    и password-путь.)
   - **Agent forwarding** (флаг `--agent-forwarding` у `ssh-connect`,
     `ssh-jump-connect`, `ssh-chain-connect`; поле `SshSettings.agent_forwarding`,
     **по умолчанию выключено**). Когда включено и `$SSH_AUTH_SOCK` задан: на
@@ -347,10 +379,13 @@ cargo test --workspace
     `NEXTERM_CHAIN_*`; для `-R` ещё `NEXTERM_REMOTE_TEST_BIND` /
     `NEXTERM_REMOTE_CHAIN_TEST_BIND`; для curl-проверки SOCKS —
     `NEXTERM_SOCKS_TEST_URL`), `agent_forwarding_roundtrip` (`rrs-protocols`, env
-    `NEXTERM_SSH_TEST_*` + запущенный `SSH_AUTH_SOCK`), плюс `sftp_roundtrip`
-    (direct).
-  - Ещё не сделано: несколько `-R` на одно соединение; отдельный `CredentialRef`
-    для key-passphrase.
+    `NEXTERM_SSH_TEST_*` + запущенный `SSH_AUTH_SOCK`),
+    `encrypted_key_passphrase_roundtrip` (`rrs-protocols`, env
+    `NEXTERM_SSH_TEST_*` + `NEXTERM_SSH_TEST_ENCRYPTED_KEY` +
+    `NEXTERM_SSH_TEST_KEY_PASSPHRASE`), плюс `sftp_roundtrip` (direct).
+  - Ещё не сделано: несколько `-R` на одно соединение; key-passphrase в
+    `profiles add-ssh` (CLI пока через env; GUI будет писать в keyring через
+    `CredentialStore`).
 - `pty` — локальный shell через PTY (`portable-pty`), в крейте `rrs-terminal`.
 - `local-pty` (на `rrs-cli`/`rrs-protocols`) — local-shell как полноценный транспорт
   через `AppCore::connect` (`LocalShellConnector`/`LocalPtySession`); тянет `pty`.
@@ -362,11 +397,18 @@ cargo run -p xtask -- build      # | build-release | test | fmt | lint | run-cli
 ```
 
 ## Безопасность секретов
-- Профили и группы **никогда** не содержат паролей/ключей — только `CredentialRef`
-  (UUID + нcaption-метка). Сам секрет лежит в OS-keyring (с `keyring-os`) или
-  только в памяти (по умолчанию) и зануляется при удалении (`zeroize`).
+- Профили и группы **никогда** не содержат паролей/ключей/passphrase — только
+  `CredentialRef` (UUID + несекретная метка). Сам секрет лежит в OS-keyring (с
+  `keyring-os`) или только в памяти (по умолчанию) и зануляется при удалении
+  (`zeroize`).
+- **Password и private-key passphrase — разные секреты с разными `CredentialRef`**:
+  password — `ConnectionProfile.credential`; passphrase — `SshSettings.key_passphrase`.
+  `AppCore` резолвит их в независимые поля `ResolvedCredentials` (`password` /
+  `key_passphrase`) и не смешивает; encrypted key расшифровывается только
+  passphrase, password идёт только в password/keyboard-interactive auth.
 - Тип `Secret` не реализует `Display`/`Serialize`, а его `Debug` печатает
-  `Secret(***)`, чтобы секреты не утекали в логи/файлы.
+  `Secret(***)`; `ResolvedCredentials::Debug` редактирует оба секрета — чтобы
+  ничего не утекало в логи/файлы.
 - Блокирующие вызовы keyring выполняются на blocking-пуле, не на UI-потоке.
 
 ## Логи

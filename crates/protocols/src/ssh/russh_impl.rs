@@ -842,20 +842,33 @@ async fn try_key_auth(
     let Some(path) = ssh.private_key_path.clone() else {
         return Ok(false);
     };
+    // The passphrase comes ONLY from `key_passphrase` — never the password.
+    // Copying into a `String` for russh's API breaks zeroize for the copy (same
+    // as the password path); the copy is transient and never logged.
+    let has_passphrase = creds.key_passphrase.is_some();
     let passphrase = creds
         .key_passphrase
         .as_ref()
         .map(|s| s.expose().to_string());
 
     // Reading + decrypting the key file is blocking I/O.
+    let key_path = path.clone();
     let loaded = tokio::task::spawn_blocking(move || load_secret_key(&path, passphrase.as_deref()))
         .await
         .map_err(|e| ProtocolError::Auth(format!("key load task failed: {e}")))?;
     let key = match loaded {
         Ok(k) => k,
         Err(e) => {
-            // A bad key/passphrase is recoverable — fall through to the next method.
-            tracing::warn!("failed to load private key: {e}");
+            // A bad/missing passphrase or bad key is recoverable — warn with
+            // useful context (no secret) and fall through to the next method.
+            if has_passphrase {
+                tracing::warn!("failed to load private key {key_path}: {e}");
+            } else {
+                tracing::warn!(
+                    "failed to load private key {key_path}: {e} \
+                     (if the key is encrypted, provide its passphrase via key_passphrase)"
+                );
+            }
             return Ok(false);
         }
     };
@@ -1572,6 +1585,67 @@ mod tests {
             text.contains("SOCK=/"),
             "expected a forwarded SSH_AUTH_SOCK on the target, got: {text}"
         );
+        session.close().await.expect("close");
+    }
+
+    /// Live round-trip with an **encrypted** private key, decrypted using the
+    /// key passphrase (NOT the password). Ignored by default (needs a reachable
+    /// sshd that authorizes the encrypted key). Run e.g.:
+    ///
+    /// ```text
+    /// NEXTERM_SSH_TEST_HOST=127.0.0.1 NEXTERM_SSH_TEST_USER=$USER \
+    /// NEXTERM_SSH_TEST_ENCRYPTED_KEY=$HOME/.ssh/id_ed25519_enc \
+    /// NEXTERM_SSH_TEST_KEY_PASSPHRASE=secret \
+    /// cargo test -p rrs-protocols --features ssh-russh -- --ignored encrypted_key_passphrase_roundtrip
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires a reachable sshd authorizing an encrypted key; see doc comment"]
+    async fn encrypted_key_passphrase_roundtrip() {
+        use rrs_credentials::Secret;
+
+        let host = std::env::var("NEXTERM_SSH_TEST_HOST").expect("NEXTERM_SSH_TEST_HOST");
+        let user = std::env::var("NEXTERM_SSH_TEST_USER").expect("NEXTERM_SSH_TEST_USER");
+        let key = std::env::var("NEXTERM_SSH_TEST_ENCRYPTED_KEY")
+            .expect("NEXTERM_SSH_TEST_ENCRYPTED_KEY");
+        let passphrase = std::env::var("NEXTERM_SSH_TEST_KEY_PASSPHRASE")
+            .expect("NEXTERM_SSH_TEST_KEY_PASSPHRASE");
+
+        let ssh = SshSettings {
+            host,
+            username: user,
+            private_key_path: Some(key),
+            strict_host_key_checking: false,
+            // Only the agent and public-key methods (no password) so the test
+            // proves the encrypted key + passphrase path specifically.
+            auth_methods: vec![AuthMethod::PublicKey],
+            ..SshSettings::default()
+        };
+        // The passphrase lives in key_passphrase; password is left None.
+        let creds = ResolvedCredentials {
+            key_passphrase: Some(Secret::new(passphrase)),
+            ..ResolvedCredentials::default()
+        };
+
+        let mut session = SshConnection::connect(&ssh, &creds)
+            .await
+            .expect("connect with encrypted key")
+            .open_shell()
+            .await
+            .expect("open shell");
+        session
+            .write(b"echo KEY_OK; whoami; exit\n")
+            .await
+            .expect("write");
+        let mut out = Vec::new();
+        loop {
+            let chunk = session.read().await.expect("read");
+            if chunk.is_empty() {
+                break;
+            }
+            out.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("KEY_OK"), "unexpected output: {text}");
         session.close().await.expect("close");
     }
 }

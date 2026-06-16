@@ -192,3 +192,26 @@ pub trait SftpClient: Send + Sync {
     async fn rename(&self, from: &str, to: &str) -> Result<()>;
     async fn set_permissions(&self, path: &str, mode: u32) -> Result<()>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rrs_credentials::Secret;
+
+    #[test]
+    fn resolved_credentials_debug_redacts_both_secrets() {
+        let creds = ResolvedCredentials {
+            password: Some(Secret::new("the-password")),
+            key_passphrase: Some(Secret::new("the-passphrase")),
+        };
+        let dbg = format!("{creds:?}");
+        // Neither secret value leaks; both are shown as redacted markers.
+        assert!(!dbg.contains("the-password"), "password leaked: {dbg}");
+        assert!(!dbg.contains("the-passphrase"), "passphrase leaked: {dbg}");
+        assert!(dbg.contains("***"), "expected redaction marker: {dbg}");
+
+        // The default (no secrets) shows both as None.
+        let empty = format!("{:?}", ResolvedCredentials::default());
+        assert!(empty.contains("None"), "{empty}");
+    }
+}

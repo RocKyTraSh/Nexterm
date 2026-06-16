@@ -57,10 +57,19 @@ pub struct SshSettings {
     pub username: String,
     #[serde(default)]
     pub auth_methods: Vec<AuthMethod>,
-    /// Path to a private key file on disk. The passphrase, if any, lives in the
-    /// secret store referenced by [`ConnectionProfile::credential`].
+    /// Path to a private key file on disk.
     #[serde(default)]
     pub private_key_path: Option<String>,
+    /// Reference to the **private key's passphrase** secret, if the key is
+    /// encrypted. A pointer into the secret store — never the passphrase itself.
+    ///
+    /// This is independent from the profile's password credential
+    /// ([`ConnectionProfile::credential`]): a password and a key passphrase are
+    /// different secrets and must never be confused. The password ref currently
+    /// lives at the profile level; renaming/moving it is deferred to avoid churn
+    /// (TODO: a clearer per-purpose credential layout once a GUI exists).
+    #[serde(default)]
+    pub key_passphrase: Option<CredentialRef>,
     /// Optional jump host (gateway). Points at another profile's id, enabling
     /// `ProxyJump`-style chaining. Chains of length > 1 are a roadmap item.
     #[serde(default)]
@@ -85,6 +94,7 @@ impl Default for SshSettings {
                 AuthMethod::Password,
             ],
             private_key_path: None,
+            key_passphrase: None,
             jump_host: None,
             strict_host_key_checking: true,
             agent_forwarding: false,
@@ -217,5 +227,51 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: SshSettings = serde_json::from_str(&json).unwrap();
         assert!(back.agent_forwarding);
+    }
+
+    #[test]
+    fn key_passphrase_defaults_to_none() {
+        assert!(SshSettings::default().key_passphrase.is_none());
+        let profile = ConnectionProfile::new_ssh("h", "host", "user");
+        if let ProtocolSettings::Ssh(s) = &profile.settings {
+            assert!(s.key_passphrase.is_none());
+        } else {
+            panic!("expected SSH settings");
+        }
+    }
+
+    #[test]
+    fn old_profile_without_key_passphrase_deserializes() {
+        // A pre-existing SshSettings JSON (with a key path but no passphrase
+        // field) must still load — the field is `#[serde(default)]`.
+        let json = r#"{"host":"h","port":22,"username":"u","private_key_path":"/k"}"#;
+        let s: SshSettings = serde_json::from_str(json).expect("deserialize legacy settings");
+        assert!(s.key_passphrase.is_none());
+        assert_eq!(s.private_key_path.as_deref(), Some("/k"));
+    }
+
+    #[test]
+    fn key_passphrase_ref_roundtrips_and_coexists_with_password() {
+        // The key-passphrase ref (in SshSettings) and the password ref (on the
+        // profile) are independent and can both be set.
+        let mut profile = ConnectionProfile::new_ssh("h", "host", "user");
+        profile.credential = Some(CredentialRef::new("password"));
+        let pp_ref = CredentialRef::new("key-passphrase");
+        if let ProtocolSettings::Ssh(s) = &mut profile.settings {
+            s.key_passphrase = Some(pp_ref.clone());
+        }
+
+        let json = serde_json::to_string(&profile).unwrap();
+        // Sanity: the JSON carries only refs (ids/labels), never a secret value.
+        assert!(json.contains("key-passphrase"));
+        assert!(json.contains("password"));
+
+        let back: ConnectionProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.credential.unwrap().label, "password");
+        if let ProtocolSettings::Ssh(s) = &back.settings {
+            assert_eq!(s.key_passphrase.as_ref().unwrap().id, pp_ref.id);
+        } else {
+            panic!("expected SSH settings");
+        }
     }
 }
