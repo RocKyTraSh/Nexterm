@@ -13,19 +13,21 @@
 //! * an interactive PTY shell exposed as [`RemoteSession`];
 //! * SFTP (`list_dir` / `stat` / `read_file` / `write_file` / `mkdir` /
 //!   `remove` / `rename` / `chmod`) via [`RusshSftp`];
-//! * single-hop jump-host (`ProxyJump`) chaining over a `direct-tcpip` channel,
-//!   for both **shell** ([`Connector::connect_shell_via_jump`]) and **SFTP**
-//!   ([`RusshSftp::connect_via_jump`] / [`Connector::connect_sftp_via_jump`]);
+//! * multi-hop jump-host (`ProxyJump`) chaining over `direct-tcpip` channels,
+//!   for both **shell** ([`Connector::connect_shell_via_jump_chain`]) and
+//!   **SFTP** ([`Connector::connect_sftp_via_jump_chain`]); single-hop helpers
+//!   ([`Connector::connect_shell_via_jump`], [`RusshSftp::connect_via_jump`])
+//!   delegate to the chain path. Up to [`MAX_JUMP_CHAIN`] gateways;
 //! * a reusable `direct-tcpip` forwarding stream ([`SshConnection::open_forward_stream`])
 //!   that backs the `rrs-tunnels` russh driver.
 //!
 //! The connection lifecycle (TCP/stream connect → host-key check → auth) lives
 //! in one reusable primitive, [`SshConnection`], so shells, SFTP, jump-host
 //! chaining, and tunnels all share the same code path (no copy-pasted auth /
-//! known_hosts logic).
+//! known_hosts logic). Each hop in a chain is verified and authenticated
+//! independently.
 //!
 //! Not yet implemented (clear errors / TODOs, no fake behavior):
-//! * multi-hop jump-host chains (length > 1) — only one gateway is supported;
 //! * agent forwarding into the channel.
 //!
 //! Secrets: passwords / passphrases come from [`ResolvedCredentials`] only, are
@@ -45,7 +47,8 @@ use rrs_core::model::{AuthMethod, ConnectionProfile, ProtocolSettings, SshSettin
 
 use crate::error::{ProtocolError, Result};
 use crate::traits::{
-    Connector, DirEntry, EntryKind, RemoteSession, ResolvedCredentials, SftpClient,
+    Connector, DirEntry, EntryKind, JumpHop, RemoteSession, ResolvedCredentials, SftpClient,
+    MAX_JUMP_CHAIN,
 };
 
 /// Initial PTY geometry; the frontend resizes on attach.
@@ -250,39 +253,72 @@ impl SshConnection {
         })
     }
 
-    /// Connect to `target_ssh` through the gateway `jump_ssh`: open a
-    /// `direct-tcpip` channel on the gateway to the target's `host:port`, then
-    /// run a full SSH session (host-key check + auth) over that channel.
-    ///
-    /// Single hop only. Both endpoints are verified independently against their
-    /// own `known_hosts` policy; secrets for each come from their own
-    /// [`ResolvedCredentials`].
+    /// Open a `direct-tcpip` channel on this connection to `host:port` and run a
+    /// full SSH session (host-key check + auth) over it, returning the new
+    /// connection (which keeps `self` alive as its underlying transport).
+    async fn hop_to(
+        self,
+        ssh: &SshSettings,
+        creds: &ResolvedCredentials,
+        what: &str,
+    ) -> Result<Self> {
+        let channel = self
+            .handle
+            .channel_open_direct_tcpip(ssh.host.clone(), ssh.port as u32, "127.0.0.1", 0)
+            .await
+            .map_err(|e| {
+                ProtocolError::Connect(format!(
+                    "direct-tcpip to {what} {}:{} failed: {e}",
+                    ssh.host, ssh.port
+                ))
+            })?;
+        SshConnection::connect_over_stream(ssh, creds, channel.into_stream(), self).await
+    }
+
+    /// Connect to `target_ssh` through the single gateway `jump_ssh`. Thin
+    /// wrapper over [`connect_via_jump_chain`](Self::connect_via_jump_chain).
     pub async fn connect_via_jump_host(
         jump_ssh: &SshSettings,
         jump_creds: &ResolvedCredentials,
         target_ssh: &SshSettings,
         target_creds: &ResolvedCredentials,
     ) -> Result<Self> {
-        validate_jump_chain(jump_ssh, target_ssh)?;
-
-        // 1. Establish + authenticate the gateway.
-        let jump = SshConnection::connect(jump_ssh, jump_creds).await?;
-
-        // 2. Ask the gateway to open a TCP connection to the target.
-        let channel = jump
-            .handle
-            .channel_open_direct_tcpip(
-                target_ssh.host.clone(),
-                target_ssh.port as u32,
-                "127.0.0.1",
-                0,
-            )
+        SshConnection::connect_via_jump_chain(&[(jump_ssh, jump_creds)], target_ssh, target_creds)
             .await
-            .map_err(|e| ProtocolError::Connect(format!("jump host direct-tcpip failed: {e}")))?;
+    }
 
-        // 3. Run the target SSH session over that channel's byte stream.
-        SshConnection::connect_over_stream(target_ssh, target_creds, channel.into_stream(), jump)
-            .await
+    /// Connect to `target_ssh` through an ordered chain of gateways
+    /// (`gateways[0] → gateways[1] → … → target`).
+    ///
+    /// The first gateway is reached over a fresh TCP socket; every subsequent
+    /// gateway (and finally the target) is reached over a `direct-tcpip` channel
+    /// of the previous hop. Each hop is verified against its own `known_hosts`
+    /// policy and authenticated from its own [`ResolvedCredentials`]; no
+    /// auth/host-key logic is duplicated (every hop goes through
+    /// [`connect`](Self::connect) / [`connect_over_stream`](Self::connect_over_stream)).
+    ///
+    /// An empty `gateways` slice degenerates to a direct [`connect`](Self::connect).
+    pub async fn connect_via_jump_chain(
+        gateways: &[(&SshSettings, &ResolvedCredentials)],
+        target_ssh: &SshSettings,
+        target_creds: &ResolvedCredentials,
+    ) -> Result<Self> {
+        let gw_settings: Vec<&SshSettings> = gateways.iter().map(|(s, _)| *s).collect();
+        validate_jump_chain_endpoints(&gw_settings, target_ssh)?;
+
+        let Some(((first_ssh, first_creds), rest)) = gateways.split_first() else {
+            // No gateways → plain direct connect.
+            return SshConnection::connect(target_ssh, target_creds).await;
+        };
+
+        // First gateway over a fresh TCP socket.
+        let mut conn = SshConnection::connect(first_ssh, first_creds).await?;
+        // Each subsequent gateway over the previous hop.
+        for (next_ssh, next_creds) in rest {
+            conn = conn.hop_to(next_ssh, next_creds, "jump host").await?;
+        }
+        // Final hop to the target over the last gateway.
+        conn.hop_to(target_ssh, target_creds, "target").await
     }
 
     /// Open a bare session channel on this connection.
@@ -349,23 +385,55 @@ impl SshConnection {
     }
 }
 
-/// Validate a single-hop jump chain before opening any socket. Pure (unit-tested).
-pub fn validate_jump_chain(jump: &SshSettings, target: &SshSettings) -> Result<()> {
-    if jump.host.trim().is_empty() {
-        return Err(ProtocolError::Connect("jump host address is empty".into()));
+/// Validate an ordered chain of gateway endpoints plus the final target before
+/// opening any socket. Pure (unit-tested).
+///
+/// Checks: depth bound ([`MAX_JUMP_CHAIN`]); no empty host on any hop; and no
+/// two *adjacent* endpoints identical (a hop to the same `host:port` is a
+/// self-loop / no-op). Full cycle detection (by profile identity) is the
+/// orchestration layer's job — here we only see resolved settings.
+pub fn validate_jump_chain_endpoints(
+    gateways: &[&SshSettings],
+    target: &SshSettings,
+) -> Result<()> {
+    if gateways.len() > MAX_JUMP_CHAIN {
+        return Err(ProtocolError::Connect(format!(
+            "jump chain too deep: {} gateways (max {MAX_JUMP_CHAIN})",
+            gateways.len()
+        )));
+    }
+    for g in gateways {
+        if g.host.trim().is_empty() {
+            return Err(ProtocolError::Connect("jump host address is empty".into()));
+        }
     }
     if target.host.trim().is_empty() {
         return Err(ProtocolError::Connect(
             "target host address is empty".into(),
         ));
     }
-    // A gateway pointing at itself is a configuration mistake, not a chain.
-    if jump.host == target.host && jump.port == target.port {
-        return Err(ProtocolError::Connect(
-            "jump host and target are the same host:port".into(),
-        ));
+    // Walk gateway endpoints then the target, rejecting adjacent duplicates.
+    let endpoints = gateways
+        .iter()
+        .map(|g| (g.host.as_str(), g.port))
+        .chain(std::iter::once((target.host.as_str(), target.port)));
+    let mut prev: Option<(&str, u16)> = None;
+    for ep in endpoints {
+        if Some(ep) == prev {
+            return Err(ProtocolError::Connect(format!(
+                "two consecutive jump endpoints are identical ({}:{})",
+                ep.0, ep.1
+            )));
+        }
+        prev = Some(ep);
     }
     Ok(())
+}
+
+/// Validate a single-hop jump chain. Thin wrapper over
+/// [`validate_jump_chain_endpoints`]; kept for the single-hop call sites.
+pub fn validate_jump_chain(jump: &SshSettings, target: &SshSettings) -> Result<()> {
+    validate_jump_chain_endpoints(&[jump], target)
 }
 
 /// SSH connector backed by `russh`.
@@ -401,8 +469,7 @@ impl Connector for RusshConnector {
     }
 
     /// Connect to `target` through the gateway `jump`, returning a shell on the
-    /// **target** (not the gateway). Both hops are verified and authenticated
-    /// independently from their own profile + transient credentials.
+    /// **target** (not the gateway). Single-hop convenience over the chain path.
     async fn connect_shell_via_jump(
         &self,
         jump: &ConnectionProfile,
@@ -410,12 +477,8 @@ impl Connector for RusshConnector {
         target: &ConnectionProfile,
         target_creds: &ResolvedCredentials,
     ) -> Result<Box<dyn RemoteSession>> {
-        let jump_ssh = ssh_settings(jump)?;
-        let target_ssh = ssh_settings(target)?;
-        let conn =
-            SshConnection::connect_via_jump_host(jump_ssh, jump_creds, target_ssh, target_creds)
-                .await?;
-        Ok(Box::new(conn.open_shell().await?))
+        self.connect_shell_via_jump_chain(&[JumpHop::new(jump, jump_creds)], target, target_creds)
+            .await
     }
 
     async fn connect_sftp(
@@ -433,10 +496,44 @@ impl Connector for RusshConnector {
         target: &ConnectionProfile,
         target_creds: &ResolvedCredentials,
     ) -> Result<Box<dyn SftpClient>> {
-        Ok(Box::new(
-            RusshSftp::connect_via_jump(jump, jump_creds, target, target_creds).await?,
-        ))
+        self.connect_sftp_via_jump_chain(&[JumpHop::new(jump, jump_creds)], target, target_creds)
+            .await
     }
+
+    async fn connect_shell_via_jump_chain(
+        &self,
+        gateways: &[JumpHop<'_>],
+        target: &ConnectionProfile,
+        target_creds: &ResolvedCredentials,
+    ) -> Result<Box<dyn RemoteSession>> {
+        let conn = connect_chain(gateways, target, target_creds).await?;
+        Ok(Box::new(conn.open_shell().await?))
+    }
+
+    async fn connect_sftp_via_jump_chain(
+        &self,
+        gateways: &[JumpHop<'_>],
+        target: &ConnectionProfile,
+        target_creds: &ResolvedCredentials,
+    ) -> Result<Box<dyn SftpClient>> {
+        let conn = connect_chain(gateways, target, target_creds).await?;
+        Ok(Box::new(conn.open_sftp().await?))
+    }
+}
+
+/// Resolve profiles to SSH settings and establish a connection to `target`
+/// through the ordered `gateways`. Shared by the shell and SFTP chain paths.
+async fn connect_chain(
+    gateways: &[JumpHop<'_>],
+    target: &ConnectionProfile,
+    target_creds: &ResolvedCredentials,
+) -> Result<SshConnection> {
+    let target_ssh = ssh_settings(target)?;
+    let mut hops: Vec<(&SshSettings, &ResolvedCredentials)> = Vec::with_capacity(gateways.len());
+    for hop in gateways {
+        hops.push((ssh_settings(hop.profile)?, hop.creds));
+    }
+    SshConnection::connect_via_jump_chain(&hops, target_ssh, target_creds).await
 }
 
 /// Extract SSH settings or explain why this connector cannot serve the profile.
@@ -935,6 +1032,45 @@ mod tests {
         assert!(validate_jump_chain(&jump, &other_port).is_ok());
     }
 
+    #[test]
+    fn jump_chain_endpoints_validation() {
+        let gw = |h: &str| SshSettings {
+            host: h.into(),
+            port: 22,
+            ..SshSettings::default()
+        };
+        let g1 = gw("gw1");
+        let g2 = gw("gw2");
+        let g3 = gw("gw3");
+        let target = gw("target");
+
+        // A valid multi-hop chain.
+        assert!(validate_jump_chain_endpoints(&[&g1, &g2, &g3], &target).is_ok());
+        // No gateways (degenerate) is allowed — direct connect.
+        assert!(validate_jump_chain_endpoints(&[], &target).is_ok());
+
+        // Empty host anywhere is rejected.
+        let empty = gw("  ");
+        assert!(validate_jump_chain_endpoints(&[&g1, &empty], &target).is_err());
+
+        // Adjacent identical endpoints (self-loop) are rejected...
+        assert!(validate_jump_chain_endpoints(&[&g1, &g1], &target).is_err());
+        assert!(validate_jump_chain_endpoints(&[&g1, &target], &target).is_err());
+        // ...but a non-adjacent repeat is left to the orchestration layer.
+        assert!(validate_jump_chain_endpoints(&[&g1, &g2, &g1], &target).is_ok());
+
+        // Too many gateways is rejected.
+        let many: Vec<SshSettings> = (0..MAX_JUMP_CHAIN + 1)
+            .map(|i| gw(&format!("g{i}")))
+            .collect();
+        let refs: Vec<&SshSettings> = many.iter().collect();
+        assert!(validate_jump_chain_endpoints(&refs, &target).is_err());
+        // Exactly MAX_JUMP_CHAIN gateways is allowed.
+        let max: Vec<SshSettings> = (0..MAX_JUMP_CHAIN).map(|i| gw(&format!("g{i}"))).collect();
+        let max_refs: Vec<&SshSettings> = max.iter().collect();
+        assert!(validate_jump_chain_endpoints(&max_refs, &target).is_ok());
+    }
+
     /// Live SFTP round-trip against a real sshd. Ignored by default (needs a
     /// server); run manually with publickey auth, e.g.:
     ///
@@ -1078,5 +1214,83 @@ mod tests {
         // Listing must succeed; "." / ".." are usually present but not required.
         let listing = sftp.list_dir(&path).await.expect("list_dir over jump");
         println!("listed {} entries in {path} via jump host", listing.len());
+    }
+
+    /// Build a chain hop's SSH settings from `PREFIX_HOST/USER/KEY` env vars.
+    #[cfg(test)]
+    fn chain_hop(prefix: &str) -> (SshSettings, ResolvedCredentials) {
+        let host = std::env::var(format!("{prefix}_HOST")).expect("HOST");
+        let user = std::env::var(format!("{prefix}_USER")).expect("USER");
+        let key = std::env::var(format!("{prefix}_KEY")).ok();
+        let ssh = SshSettings {
+            host,
+            username: user,
+            private_key_path: key,
+            strict_host_key_checking: false,
+            ..SshSettings::default()
+        };
+        (ssh, ResolvedCredentials::default())
+    }
+
+    /// Live two-gateway shell chain round-trip (`gw1 → gw2 → target`). Ignored by
+    /// default (needs three reachable sshd endpoints, where gw1 reaches gw2 and
+    /// gw2 reaches the target). Run with publickey auth, e.g.:
+    ///
+    /// ```text
+    /// NEXTERM_CHAIN_JUMP1_HOST=gw1 NEXTERM_CHAIN_JUMP1_USER=$USER NEXTERM_CHAIN_JUMP1_KEY=~/.ssh/id_ed25519 \
+    /// NEXTERM_CHAIN_JUMP2_HOST=gw2 NEXTERM_CHAIN_JUMP2_USER=$USER NEXTERM_CHAIN_JUMP2_KEY=~/.ssh/id_ed25519 \
+    /// NEXTERM_CHAIN_TARGET_HOST=t  NEXTERM_CHAIN_TARGET_USER=root NEXTERM_CHAIN_TARGET_KEY=~/.ssh/id_ed25519 \
+    /// cargo test -p rrs-protocols --features ssh-russh -- --ignored jump_chain_roundtrip
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires three reachable sshd endpoints; see doc comment"]
+    async fn jump_chain_roundtrip() {
+        let (gw1, gw1c) = chain_hop("NEXTERM_CHAIN_JUMP1");
+        let (gw2, gw2c) = chain_hop("NEXTERM_CHAIN_JUMP2");
+        let (target, tc) = chain_hop("NEXTERM_CHAIN_TARGET");
+
+        let conn =
+            SshConnection::connect_via_jump_chain(&[(&gw1, &gw1c), (&gw2, &gw2c)], &target, &tc)
+                .await
+                .expect("chain connect");
+        let mut session = conn.open_shell().await.expect("open shell");
+        session
+            .write(b"echo CHAIN_OK\nexit\n")
+            .await
+            .expect("write");
+        let mut out = Vec::new();
+        loop {
+            let chunk = session.read().await.expect("read");
+            if chunk.is_empty() {
+                break;
+            }
+            out.extend_from_slice(&chunk);
+        }
+        assert!(
+            String::from_utf8_lossy(&out).contains("CHAIN_OK"),
+            "unexpected target output"
+        );
+        session.close().await.expect("close");
+    }
+
+    /// Live two-gateway **SFTP** chain round-trip. Ignored by default. Same env
+    /// as [`jump_chain_roundtrip`] plus `NEXTERM_CHAIN_TARGET_SFTP_PATH`.
+    #[tokio::test]
+    #[ignore = "requires three reachable sshd endpoints; see doc comment"]
+    async fn sftp_jump_chain_roundtrip() {
+        let (gw1, gw1c) = chain_hop("NEXTERM_CHAIN_JUMP1");
+        let (gw2, gw2c) = chain_hop("NEXTERM_CHAIN_JUMP2");
+        let (target, tc) = chain_hop("NEXTERM_CHAIN_TARGET");
+        let path = std::env::var("NEXTERM_CHAIN_TARGET_SFTP_PATH").unwrap_or_else(|_| "/".into());
+
+        let sftp =
+            SshConnection::connect_via_jump_chain(&[(&gw1, &gw1c), (&gw2, &gw2c)], &target, &tc)
+                .await
+                .expect("chain connect")
+                .open_sftp()
+                .await
+                .expect("open sftp");
+        let listing = sftp.list_dir(&path).await.expect("list_dir over chain");
+        println!("listed {} entries in {path} via 2-hop chain", listing.len());
     }
 }

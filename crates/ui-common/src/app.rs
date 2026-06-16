@@ -6,6 +6,7 @@
 //! never touch transports or storage directly — which is what lets us add
 //! protocols and swap backends without changing UI code.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -21,7 +22,9 @@ use rrs_core::registry::SessionRegistry;
 use rrs_core::store::{FileProfileStore, ProfileStore};
 use rrs_credentials::{CredentialStore, Secret};
 use rrs_miniservers::MiniServerManager;
-use rrs_protocols::{Connector, RemoteSession, ResolvedCredentials, SftpClient};
+use rrs_protocols::{
+    Connector, JumpHop, RemoteSession, ResolvedCredentials, SftpClient, MAX_JUMP_CHAIN,
+};
 
 /// The central application object.
 pub struct AppCore {
@@ -154,17 +157,18 @@ impl AppCore {
         }
     }
 
-    /// Open a shell for `profile`, dispatching to the jump-host path when the
+    /// Open a shell for `profile`, dispatching to the jump-chain path when the
     /// profile names a gateway. Pure orchestration over the [`Connector`] trait.
     async fn open_shell(
         &self,
         connector: &dyn Connector,
         profile: &ConnectionProfile,
     ) -> anyhow::Result<Box<dyn RemoteSession>> {
-        if let Some(jump_id) = ssh_jump_host(profile) {
-            let (jump, jump_creds, target_creds) = self.resolve_jump(profile, jump_id).await?;
+        if ssh_jump_host(profile).is_some() {
+            let (gateways, target_creds) = self.resolve_jump_chain(profile).await?;
+            let hops: Vec<JumpHop<'_>> = gateways.iter().map(|(p, c)| JumpHop::new(p, c)).collect();
             connector
-                .connect_shell_via_jump(&jump, &jump_creds, profile, &target_creds)
+                .connect_shell_via_jump_chain(&hops, profile, &target_creds)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))
         } else {
@@ -178,7 +182,7 @@ impl AppCore {
 
     /// Open an SFTP client for `profile` (UI-friendly facade for the file
     /// browser). Works directly or, when the profile names a `jump_host`,
-    /// through the gateway — the same orchestration as [`connect`](Self::connect).
+    /// through the gateway chain — the same orchestration as [`connect`](Self::connect).
     ///
     /// SFTP is SSH-only, so this always uses the main SSH connector; a non-SSH
     /// profile yields a clear error from the connector.
@@ -187,10 +191,11 @@ impl AppCore {
         profile: &ConnectionProfile,
     ) -> anyhow::Result<Box<dyn SftpClient>> {
         let connector = Arc::clone(&self.connector);
-        if let Some(jump_id) = ssh_jump_host(profile) {
-            let (jump, jump_creds, target_creds) = self.resolve_jump(profile, jump_id).await?;
+        if ssh_jump_host(profile).is_some() {
+            let (gateways, target_creds) = self.resolve_jump_chain(profile).await?;
+            let hops: Vec<JumpHop<'_>> = gateways.iter().map(|(p, c)| JumpHop::new(p, c)).collect();
             connector
-                .connect_sftp_via_jump(&jump, &jump_creds, profile, &target_creds)
+                .connect_sftp_via_jump_chain(&hops, profile, &target_creds)
                 .await
                 .map_err(|e| anyhow::anyhow!("sftp connect failed: {e}"))
         } else {
@@ -202,43 +207,66 @@ impl AppCore {
         }
     }
 
-    /// Resolve a single-hop jump chain: load the gateway profile from the store,
-    /// validate it, and resolve transient credentials for both hops.
+    /// Resolve the ordered gateway chain for `target` from the profile store.
     ///
-    /// Errors are explicit: gateway not found, gateway is not SSH, or the chain
-    /// is longer than one hop (the gateway itself names a jump host).
-    async fn resolve_jump(
+    /// Walks `jump_host` links starting at `target` (target → its gateway → that
+    /// gateway's gateway → …), then returns the gateways in **connection order**
+    /// (`gateway1 → gateway2 → … → target`) each paired with transient
+    /// credentials, plus the target's credentials.
+    ///
+    /// Errors are explicit: gateway not found, gateway is not SSH, a cycle in
+    /// the `jump_host` links, or a chain deeper than [`MAX_JUMP_CHAIN`].
+    async fn resolve_jump_chain(
         &self,
         target: &ConnectionProfile,
-        jump_id: Uuid,
-    ) -> anyhow::Result<(ConnectionProfile, ResolvedCredentials, ResolvedCredentials)> {
-        let jump = self
-            .profiles
-            .get_profile(jump_id)
-            .await
-            .context("loading jump host profile")?
-            .with_context(|| format!("jump host profile {jump_id} not found"))?;
+    ) -> anyhow::Result<(
+        Vec<(ConnectionProfile, ResolvedCredentials)>,
+        ResolvedCredentials,
+    )> {
+        // Walk links: collected in walk order (gateway nearest the target first).
+        let mut walk: Vec<ConnectionProfile> = Vec::new();
+        let mut seen: HashSet<Uuid> = HashSet::new();
+        seen.insert(target.id);
 
-        match &jump.settings {
-            ProtocolSettings::Ssh(s) => {
-                if s.jump_host.is_some() {
-                    anyhow::bail!(
-                        "jump host chains longer than one hop are not supported yet \
-                         (gateway '{}' itself names a jump host)",
-                        jump.name
-                    );
-                }
+        let mut next = ssh_jump_host(target);
+        while let Some(jid) = next {
+            if walk.len() >= MAX_JUMP_CHAIN {
+                anyhow::bail!(
+                    "jump chain too deep for '{}': more than {MAX_JUMP_CHAIN} gateways",
+                    target.name
+                );
             }
-            other => anyhow::bail!(
-                "jump host profile '{}' is not an SSH profile (it is {:?})",
-                jump.name,
-                other.kind()
-            ),
+            if !seen.insert(jid) {
+                anyhow::bail!(
+                    "jump chain cycle detected while resolving '{}' (gateway {jid} revisited)",
+                    target.name
+                );
+            }
+            let gw = self
+                .profiles
+                .get_profile(jid)
+                .await
+                .context("loading jump host profile")?
+                .with_context(|| format!("jump host profile {jid} not found"))?;
+            next = match &gw.settings {
+                ProtocolSettings::Ssh(s) => s.jump_host,
+                other => anyhow::bail!(
+                    "jump host profile '{}' is not an SSH profile (it is {:?})",
+                    gw.name,
+                    other.kind()
+                ),
+            };
+            walk.push(gw);
         }
 
-        let jump_creds = self.resolve_credentials(&jump).await?;
+        // Reverse walk order → connection order (gateway1 first), resolving creds.
+        let mut gateways = Vec::with_capacity(walk.len());
+        for gw in walk.into_iter().rev() {
+            let creds = self.resolve_credentials(&gw).await?;
+            gateways.push((gw, creds));
+        }
         let target_creds = self.resolve_credentials(target).await?;
-        Ok((jump, jump_creds, target_creds))
+        Ok((gateways, target_creds))
     }
 
     /// Store a secret for a profile's credential reference.
@@ -414,16 +442,6 @@ mod tests {
             self.record(format!("shell:{}", profile.name));
             Ok(Box::new(NullSession))
         }
-        async fn connect_shell_via_jump(
-            &self,
-            jump: &ConnectionProfile,
-            _jc: &ResolvedCredentials,
-            target: &ConnectionProfile,
-            _tc: &ResolvedCredentials,
-        ) -> rrs_protocols::Result<Box<dyn RemoteSession>> {
-            self.record(format!("jump:{}->{}", jump.name, target.name));
-            Ok(Box::new(NullSession))
-        }
         async fn connect_sftp(
             &self,
             profile: &ConnectionProfile,
@@ -432,16 +450,41 @@ mod tests {
             self.record(format!("sftp:{}", profile.name));
             Ok(Box::new(NullSftp))
         }
-        async fn connect_sftp_via_jump(
+        async fn connect_shell_via_jump_chain(
             &self,
-            jump: &ConnectionProfile,
-            _jc: &ResolvedCredentials,
+            gateways: &[JumpHop<'_>],
+            target: &ConnectionProfile,
+            _tc: &ResolvedCredentials,
+        ) -> rrs_protocols::Result<Box<dyn RemoteSession>> {
+            self.record(format!(
+                "shell_chain:{}->{}",
+                chain_names(gateways),
+                target.name
+            ));
+            Ok(Box::new(NullSession))
+        }
+        async fn connect_sftp_via_jump_chain(
+            &self,
+            gateways: &[JumpHop<'_>],
             target: &ConnectionProfile,
             _tc: &ResolvedCredentials,
         ) -> rrs_protocols::Result<Box<dyn SftpClient>> {
-            self.record(format!("sftp_jump:{}->{}", jump.name, target.name));
+            self.record(format!(
+                "sftp_chain:{}->{}",
+                chain_names(gateways),
+                target.name
+            ));
             Ok(Box::new(NullSftp))
         }
+    }
+
+    /// Join the gateway profile names in connection order (for assertions).
+    fn chain_names(gateways: &[JumpHop<'_>]) -> String {
+        gateways
+            .iter()
+            .map(|h| h.profile.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     fn core_with(store: MemProfileStore, spy: Arc<SpyConnector>) -> AppCore {
@@ -460,6 +503,28 @@ mod tests {
         p
     }
 
+    /// Build a linear chain of `n` gateways in connection order (`gw1 → … →
+    /// gwN → target`) wired through `jump_host`. Returns the target plus the
+    /// gateway profiles to seed the store with.
+    fn linear_chain(n: usize) -> (ConnectionProfile, Vec<ConnectionProfile>) {
+        let mut gateways = Vec::new();
+        let mut prev_id: Option<Uuid> = None;
+        for i in 1..=n {
+            let mut gw = ssh(&format!("gw{i}"));
+            if let Some(id) = prev_id {
+                gw = with_jump(gw, id);
+            }
+            prev_id = Some(gw.id);
+            gateways.push(gw);
+        }
+        let target = with_jump(ssh("target"), prev_id.expect("at least one gateway"));
+        (target, gateways)
+    }
+
+    fn connect_err(core_result: anyhow::Result<(Uuid, Box<dyn RemoteSession>)>) -> String {
+        core_result.map(|_| ()).unwrap_err().to_string()
+    }
+
     #[tokio::test]
     async fn connect_without_jump_uses_direct_shell() {
         let spy = Arc::new(SpyConnector::default());
@@ -469,13 +534,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_with_jump_resolves_gateway() {
+    async fn one_hop_chain_resolves_gateway() {
         let spy = Arc::new(SpyConnector::default());
-        let gw = ssh("gw");
-        let target = with_jump(ssh("target"), gw.id);
-        let core = core_with(MemProfileStore::with(vec![gw]), spy.clone());
+        let (target, gws) = linear_chain(1);
+        let core = core_with(MemProfileStore::with(gws), spy.clone());
         core.connect(&target).await.unwrap();
-        assert_eq!(spy.last().as_deref(), Some("jump:gw->target"));
+        assert_eq!(spy.last().as_deref(), Some("shell_chain:gw1->target"));
+    }
+
+    #[tokio::test]
+    async fn two_hop_chain_is_ordered() {
+        let spy = Arc::new(SpyConnector::default());
+        let (target, gws) = linear_chain(2);
+        let core = core_with(MemProfileStore::with(gws), spy.clone());
+        core.connect(&target).await.unwrap();
+        // Connection order gw1 → gw2 → target.
+        assert_eq!(spy.last().as_deref(), Some("shell_chain:gw1,gw2->target"));
+    }
+
+    #[tokio::test]
+    async fn three_hop_chain_is_ordered() {
+        let spy = Arc::new(SpyConnector::default());
+        let (target, gws) = linear_chain(3);
+        let core = core_with(MemProfileStore::with(gws), spy.clone());
+        core.connect(&target).await.unwrap();
+        assert_eq!(
+            spy.last().as_deref(),
+            Some("shell_chain:gw1,gw2,gw3->target")
+        );
+    }
+
+    #[tokio::test]
+    async fn sftp_chain_is_ordered() {
+        let spy = Arc::new(SpyConnector::default());
+        let (target, gws) = linear_chain(2);
+        let core = core_with(MemProfileStore::with(gws), spy.clone());
+        core.connect_sftp(&target).await.unwrap();
+        assert_eq!(spy.last().as_deref(), Some("sftp_chain:gw1,gw2->target"));
+
+        // Direct SFTP still works.
+        let spy2 = Arc::new(SpyConnector::default());
+        let core2 = core_with(MemProfileStore::default(), spy2.clone());
+        core2.connect_sftp(&ssh("direct")).await.unwrap();
+        assert_eq!(spy2.last().as_deref(), Some("sftp:direct"));
     }
 
     #[tokio::test]
@@ -483,12 +584,7 @@ mod tests {
         let spy = Arc::new(SpyConnector::default());
         let target = with_jump(ssh("target"), Uuid::new_v4());
         let core = core_with(MemProfileStore::default(), spy.clone());
-        let err = core
-            .connect(&target)
-            .await
-            .map(|_| ())
-            .unwrap_err()
-            .to_string();
+        let err = connect_err(core.connect(&target).await);
         assert!(err.contains("not found"), "unexpected error: {err}");
         assert_eq!(spy.last(), None, "connector must not be called");
     }
@@ -499,12 +595,7 @@ mod tests {
         let gw = ConnectionProfile::new_local_shell("local-gw", None);
         let target = with_jump(ssh("target"), gw.id);
         let core = core_with(MemProfileStore::with(vec![gw]), spy.clone());
-        let err = core
-            .connect(&target)
-            .await
-            .map(|_| ())
-            .unwrap_err()
-            .to_string();
+        let err = connect_err(core.connect(&target).await);
         assert!(
             err.contains("not an SSH profile"),
             "unexpected error: {err}"
@@ -512,39 +603,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jump_chain_longer_than_one_hop_errors() {
+    async fn jump_chain_cycle_is_detected() {
         let spy = Arc::new(SpyConnector::default());
-        let gw2 = ssh("gw2");
-        let gw1 = with_jump(ssh("gw1"), gw2.id);
+        // gw1.jump = gw2, gw2.jump = gw1 (a cycle), target.jump = gw1.
+        let mut gw1 = ssh("gw1");
+        let mut gw2 = ssh("gw2");
+        gw1 = with_jump(gw1, gw2.id);
+        gw2 = with_jump(gw2, gw1.id);
         let target = with_jump(ssh("target"), gw1.id);
-        let core = core_with(MemProfileStore::with(vec![gw2, gw1]), spy.clone());
-        let err = core
-            .connect(&target)
-            .await
-            .map(|_| ())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("longer than one hop"),
-            "unexpected error: {err}"
-        );
+        let core = core_with(MemProfileStore::with(vec![gw1, gw2]), spy.clone());
+        let err = connect_err(core.connect(&target).await);
+        assert!(err.contains("cycle"), "unexpected error: {err}");
+        assert_eq!(spy.last(), None);
     }
 
     #[tokio::test]
-    async fn connect_sftp_picks_direct_vs_jump() {
-        // Direct.
+    async fn jump_chain_too_deep_is_rejected() {
         let spy = Arc::new(SpyConnector::default());
-        let core = core_with(MemProfileStore::default(), spy.clone());
-        core.connect_sftp(&ssh("direct")).await.unwrap();
-        assert_eq!(spy.last().as_deref(), Some("sftp:direct"));
+        // One more gateway than MAX_JUMP_CHAIN allows.
+        let (target, gws) = linear_chain(MAX_JUMP_CHAIN + 1);
+        let core = core_with(MemProfileStore::with(gws), spy.clone());
+        let err = connect_err(core.connect(&target).await);
+        assert!(err.contains("too deep"), "unexpected error: {err}");
+        assert_eq!(spy.last(), None);
+    }
 
-        // Via jump.
-        let spy2 = Arc::new(SpyConnector::default());
-        let gw = ssh("gw");
-        let target = with_jump(ssh("target"), gw.id);
-        let core2 = core_with(MemProfileStore::with(vec![gw]), spy2.clone());
-        core2.connect_sftp(&target).await.unwrap();
-        assert_eq!(spy2.last().as_deref(), Some("sftp_jump:gw->target"));
+    #[tokio::test]
+    async fn max_depth_chain_is_allowed() {
+        let spy = Arc::new(SpyConnector::default());
+        let (target, gws) = linear_chain(MAX_JUMP_CHAIN);
+        let core = core_with(MemProfileStore::with(gws), spy.clone());
+        core.connect(&target).await.unwrap();
+        let recorded = spy.last().unwrap();
+        assert!(recorded.starts_with("shell_chain:gw1,"), "{recorded}");
+        assert!(recorded.ends_with("->target"), "{recorded}");
     }
 
     #[test]

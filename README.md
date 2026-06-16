@@ -32,15 +32,18 @@ SSH/Telnet/RDP/VNC/SFTP и т.д., менеджер туннелей, мульт
   `ssh-russh`): `direct-tcpip`-канал на каждое входящее соединение,
   bidirectional-прокачка байт, корректный shutdown по `stop`/Ctrl-C. Remote
   (`-R`) и dynamic SOCKS (`-D`) пока возвращают `Unsupported`.
-- **Single-hop jump-host (`ProxyJump`)** для **shell и SFTP**: подключение к
-  target *через* gateway по `direct-tcpip` — реальная вторая SSH-сессия поверх
-  канала, не `ssh target` внутри shell. Host-key и auth проверяются для обоих
-  хостов независимо.
+- **Multi-hop jump-host (`ProxyJump`) chains** для **shell и SFTP**: подключение
+  к target через цепочку gateway'ев `gateway1 → gateway2 → … → target` по
+  вложенным `direct-tcpip` каналам — реальная SSH-сессия на каждом хопе, не
+  `ssh target` внутри shell. Host-key и auth проверяются для каждого хопа
+  независимо. Глубина ограничена `MAX_JUMP_CHAIN = 8`; циклы и слишком длинные
+  цепочки явно отлавливаются. Single-hop — частный случай (одна gateway).
 - **Оркестрация jump-host в `AppCore`**: обычный `AppCore::connect(profile)` и
-  `AppCore::connect_sftp(profile)` сами резолвят gateway-профиль из `ProfileStore`
-  и секреты обоих хопов из `CredentialStore` (транзиентно), если у SSH-профиля
-  задан `jump_host`. `Connector` остаётся без доступа к хранилищам — будущий GUI
-  подключается через jump одним вызовом, без ручной оркестрации.
+  `AppCore::connect_sftp(profile)` сами разворачивают цепочку gateway-профилей из
+  `ProfileStore` (идя по `jump_host`) в порядок подключения и резолвят секреты
+  каждого хопа из `CredentialStore` (транзиентно). `Connector` остаётся без
+  доступа к хранилищам — будущий GUI подключается через цепочку одним вызовом,
+  без ручной оркестрации.
 - Рабочий HTTP-файловый мини-сервер (axum) и планировщик-мини-сервер.
 - Логика, не зависящая от GUI: мульти-ввод с защитой от опасных команд, макросы
   с предупреждением о секретах, детектор конфликтов при правке удалённых файлов,
@@ -172,6 +175,21 @@ cargo run -p rrs-cli --features ssh-russh -- sftp-jump-ls \
   --jump-host 192.168.1.10 --jump-user jumpuser \
   --target-host 10.10.10.5 --target-user root --path /etc
 
+# Multi-hop CHAIN: shell на target через gw1 -> gw2 (нужна фича ssh-russh).
+# --jump повторяется в порядке подключения; пароли — по индексу из env.
+NEXTERM_JUMP1_PASSWORD='pw1' NEXTERM_JUMP2_PASSWORD='pw2' NEXTERM_TARGET_PASSWORD='pwt' \
+cargo run -p rrs-cli --features ssh-russh -- ssh-chain-connect \
+  --jump gw1:user1 --jump gw2:user2 --target target:user3 \
+  --command 'echo CHAIN_OK; hostname'
+# Тот же chain по общему ключу на все хопы:
+cargo run -p rrs-cli --features ssh-russh -- ssh-chain-connect \
+  --jump gw1:me --jump gw2:me --target t:root --key ~/.ssh/id_ed25519
+
+# SFTP через цепочку jump-host:
+NEXTERM_JUMP1_PASSWORD='pw1' NEXTERM_JUMP2_PASSWORD='pw2' NEXTERM_TARGET_PASSWORD='pwt' \
+cargo run -p rrs-cli --features ssh-russh -- sftp-chain-ls \
+  --jump gw1:user1 --jump gw2:user2 --target target:user3 --path /etc
+
 # Подсветка строки вывода:
 cargo run -p rrs-cli -- highlight "iface eth0 is up at 10.0.0.1 error"
 
@@ -192,49 +210,56 @@ cargo test --workspace
 - `ssh-russh` — **реальный SSH/SFTP** через `russh` 0.61 + `russh-sftp` 2.3
   (крипто-бэкенд `ring`). Готово: PTY-shell как `RemoteSession`, SFTP
   (`RusshSftp`), аутентификация agent→key→password→keyboard-interactive,
-  проверка `known_hosts` с учётом `strict_host_key_checking`, **single-hop
-  jump-host (`direct-tcpip`)** и **реальный local-forwarding tunnel driver**.
-  Внутри — единый переиспользуемый примитив `SshConnection` (connect / connect
-  через jump / `open_shell` / `open_sftp` / `open_forward_stream`), без
-  копипасты auth/known_hosts.
+  проверка `known_hosts` с учётом `strict_host_key_checking`, **multi-hop
+  jump-host chains (`direct-tcpip`)** и **реальный local-forwarding tunnel
+  driver**. Внутри — единый переиспользуемый примитив `SshConnection` (connect /
+  connect через цепочку jump / `open_shell` / `open_sftp` /
+  `open_forward_stream`), без копипасты auth/known_hosts.
   - Auth methods реально готовы: **agent, public key, password,
     keyboard-interactive**. Strict mode: неизвестный host-key → отказ;
     non-strict → подключение + warning; изменённый ключ → всегда отказ.
-  - **Jump-host** для **shell** (`ssh-jump-connect`) и **SFTP**
-    (`sftp-jump-ls`): открывается `direct-tcpip` канал на gateway к
-    `target:port`, поверх него поднимается отдельная SSH-сессия к target
-    (host-key + auth проверяются для обоих хостов). Пользователь получает
-    shell/SFTP на **target**. Пароли — из `NEXTERM_JUMP_PASSWORD` /
-    `NEXTERM_TARGET_PASSWORD` (dev-only, не печатаются); ключи — `--jump-key` /
-    `--target-key`. Ограничение: один gateway (цепочки длины > 1 — TODO).
+  - **Jump-host chains** для **shell** (`ssh-jump-connect`, `ssh-chain-connect`)
+    и **SFTP** (`sftp-jump-ls`, `sftp-chain-ls`): на каждом хопе открывается
+    `direct-tcpip` канал к следующему хопу, поверх него поднимается отдельная
+    SSH-сессия (host-key + auth для каждого хопа). Пользователь получает
+    shell/SFTP на **target**. Порядок `gateway1 → … → gatewayN → target`; лимит
+    `MAX_JUMP_CHAIN = 8`; циклы/слишком длинные цепочки → явная ошибка.
+    Single-hop команды: пароли из `NEXTERM_JUMP_PASSWORD` /
+    `NEXTERM_TARGET_PASSWORD`, ключи `--jump-key`/`--target-key`. Chain-команды:
+    `--jump HOST:USER` повторяется в порядке подключения, пароли из
+    `NEXTERM_JUMP<i>_PASSWORD` (1-based) и `NEXTERM_TARGET_PASSWORD`, общий
+    `--key` на все хопы (dev-only, не печатаются).
   - **Оркестрация в `AppCore`**: `Connector` расширен методами
-    `connect_shell_via_jump` / `connect_sftp` / `connect_sftp_via_jump`
+    `connect_shell_via_jump[_chain]` / `connect_sftp[_via_jump[_chain]]`
     (default → `NotImplemented`), и `AppCore::connect`/`connect_sftp` сами
-    резолвят gateway-профиль из `ProfileStore` + секреты обоих хопов из
-    `CredentialStore`, когда у профиля задан `jump_host`. `ProfileStore` не
-    протаскивается в `Connector`; ошибки явные (gateway not found / not SSH /
-    chain > 1). Эта логика трейтовая и тестируется в default-сборке
+    разворачивают цепочку gateway-профилей из `ProfileStore` (по `jump_host`) в
+    порядок подключения + резолвят секреты каждого хопа из `CredentialStore`,
+    когда у профиля задан `jump_host`. `ProfileStore` не протаскивается в
+    `Connector`; ошибки явные (gateway not found / not SSH / cycle detected /
+    chain too deep). Логика трейтовая и тестируется в default-сборке
     (`cargo test -p rrs-ui-common`, без `russh`).
-  - **SFTP** (`sftp-ls`, `sftp-jump-ls`): `RusshSftp::connect` (direct) и
-    `RusshSftp::connect_via_jump` поверх того же `SshConnection` —
-    auth/known_hosts не дублируются.
+  - **SFTP** (`sftp-ls`, `sftp-jump-ls`, `sftp-chain-ls`): `RusshSftp::connect`
+    (direct) и `RusshSftp::connect_via_jump` / `connect_via_jump_chain` поверх
+    того же `SshConnection` — auth/known_hosts не дублируются.
   - **Tunnel driver** (`tunnel-local`): `RusshTunnelDriver` биндит локальный
     listener и форвардит каждое соединение через `direct-tcpip` на
     `target:port`. Поддержан **только local-forwarding (`-L`)**; remote (`-R`) и
     dynamic SOCKS (`-D`) → `TunnelError::Unsupported`. Драйвер живёт в
     `crates/tunnels` (фича `ssh-russh`, dep `rrs-protocols`); граф остаётся
     однонаправленным `tunnels → protocols → core`.
-  - `ssh-connect`/`ssh-jump-connect`/`tunnel-local`/`sftp-ls`/`sftp-jump-ls`
-    читают пароли из env (`--password-env` и аналоги) — это **временный
-    dev-харнесс**, не финальный UX: в проде секрет лежит в OS-keyring и
-    резолвится транзиентно.
+  - Все dev CLI-команды (`ssh-connect`, `ssh-jump-connect`, `ssh-chain-connect`,
+    `tunnel-local`, `sftp-ls`, `sftp-jump-ls`, `sftp-chain-ls`) читают пароли из
+    env — это **временный dev-харнесс**, не финальный UX: в проде секрет лежит в
+    OS-keyring и резолвится транзиентно.
   - Live-проверки `direct-tcpip` помечены `#[ignore]` и требуют sshd:
-    `jump_host_roundtrip` и `sftp_jump_roundtrip` (`rrs-protocols`, env
-    `NEXTERM_JUMP_TEST_*` + `NEXTERM_TARGET_TEST_*`, для SFTP ещё
-    `NEXTERM_TARGET_TEST_SFTP_PATH`) и `local_tunnel_roundtrip` (`rrs-tunnels`,
-    env `NEXTERM_SSH_TEST_*`); плюс `sftp_roundtrip` (direct).
-  - Ещё не сделано: цепочки jump-host длины > 1; remote (`-R`) / dynamic SOCKS
-    (`-D`) туннели; проброс SSH-агента.
+    `jump_host_roundtrip`, `sftp_jump_roundtrip`, `jump_chain_roundtrip`,
+    `sftp_jump_chain_roundtrip` (`rrs-protocols`; single-hop — env
+    `NEXTERM_JUMP_TEST_*` + `NEXTERM_TARGET_TEST_*`; chain — `NEXTERM_CHAIN_JUMP1_*`,
+    `NEXTERM_CHAIN_JUMP2_*`, `NEXTERM_CHAIN_TARGET_*` + `NEXTERM_CHAIN_TARGET_SFTP_PATH`),
+    `local_tunnel_roundtrip` (`rrs-tunnels`, env `NEXTERM_SSH_TEST_*`), плюс
+    `sftp_roundtrip` (direct).
+  - Ещё не сделано: remote (`-R`) / dynamic SOCKS (`-D`) туннели; проброс
+    SSH-агента.
 - `pty` — локальный shell через PTY (`portable-pty`), в крейте `rrs-terminal`.
 - `local-pty` (на `rrs-cli`/`rrs-protocols`) — local-shell как полноценный транспорт
   через `AppCore::connect` (`LocalShellConnector`/`LocalPtySession`); тянет `pty`.
@@ -273,14 +298,13 @@ RUST_LOG=rrs_miniservers=debug,info cargo run -p rrs-cli -- serve-http
 - будущий Qt-фронтенд требует Qt6 + CMake/qmake.
 
 ## Дорожная карта
-- **v0.2:** реальный SSH+SFTP через `russh` ✓; реальный PTY ✓; single-hop
-  jump-host для shell и SFTP ✓; оркестрация jump-host в `AppCore` ✓; реальный
-  local-forwarding tunnel driver ✓; SQLite-хранилище с миграциями; Qt/QML-скелет
-  (одно окно + вкладка поверх `AppCore`).
+- **v0.2:** реальный SSH+SFTP через `russh` ✓; реальный PTY ✓; multi-hop
+  jump-host chains для shell и SFTP ✓; оркестрация jump-host chains в `AppCore`
+  ✓; реальный local-forwarding tunnel driver ✓; SQLite-хранилище с миграциями;
+  Qt/QML-скелет (одно окно + вкладка поверх `AppCore`).
 - **v0.3:** полноценная SGR-aware подсветка; вендорные пресеты (Cisco/MikroTik/
-  …); **цепочки jump-host (длина > 1)**; **remote (`-R`) и dynamic SOCKS (`-D`)
-  туннели**; проброс SSH-агента; больше мини-серверов (TFTP/FTP/SSH);
-  GTK-фронтенд.
+  …); **remote (`-R`) и dynamic SOCKS (`-D`) туннели**; проброс SSH-агента;
+  больше мини-серверов (TFTP/FTP/SSH); GTK-фронтенд.
 - **Долгосрочно:** RDP (IronRDP) и VNC; обёртки X-сервера (Xephyr/Xvfb/Xwayland,
   без переписывания Xorg); серверы NFS/Telnet/VNC; интеграция с systemd
   (user-services); поддержка Windows (backend Windows Credential Manager за тем

@@ -218,6 +218,53 @@ enum Command {
         #[arg(long)]
         insecure: bool,
     },
+    /// Open a shell on a target through a CHAIN of jump hosts and run one
+    /// command (needs `--features ssh-russh`).
+    ///
+    /// Pass `--jump HOST:USER` once per gateway, in connection order
+    /// (first `--jump` = first hop), then `--target HOST:USER`. Per-hop
+    /// passwords come from `NEXTERM_JUMP<i>_PASSWORD` (1-based) and
+    /// `NEXTERM_TARGET_PASSWORD`; an optional shared `--key` enables publickey
+    /// auth on every hop. Passwords are never printed.
+    #[cfg(feature = "ssh-russh")]
+    SshChainConnect {
+        /// Gateway `HOST:USER` (port 22). Repeat in connection order.
+        #[arg(long = "jump", required = true)]
+        jumps: Vec<String>,
+        /// Target `HOST:USER` (port 22).
+        #[arg(long)]
+        target: String,
+        /// Shared private key applied to every hop (publickey auth).
+        #[arg(long)]
+        key: Option<String>,
+        /// Command to run on the target; defaults to a harmless probe.
+        #[arg(long)]
+        command: Option<String>,
+        /// Disable known_hosts checking for all hops (accept unknown keys).
+        #[arg(long)]
+        insecure: bool,
+    },
+    /// List a remote directory over SFTP through a CHAIN of jump hosts
+    /// (needs `--features ssh-russh`). Same `--jump`/`--target` UX as
+    /// `ssh-chain-connect`.
+    #[cfg(feature = "ssh-russh")]
+    SftpChainLs {
+        /// Gateway `HOST:USER` (port 22). Repeat in connection order.
+        #[arg(long = "jump", required = true)]
+        jumps: Vec<String>,
+        /// Target `HOST:USER` (port 22).
+        #[arg(long)]
+        target: String,
+        /// Shared private key applied to every hop (publickey auth).
+        #[arg(long)]
+        key: Option<String>,
+        /// Remote directory to list on the target.
+        #[arg(long, default_value = "/")]
+        path: String,
+        /// Disable known_hosts checking for all hops (accept unknown keys).
+        #[arg(long)]
+        insecure: bool,
+    },
     /// Show highlight spans for a line of text.
     Highlight { text: String },
     /// Check a command against the multi-exec danger rules.
@@ -357,6 +404,22 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
+        #[cfg(feature = "ssh-russh")]
+        Command::SshChainConnect {
+            jumps,
+            target,
+            key,
+            command,
+            insecure,
+        } => cmd_ssh_chain_connect(jumps, target, key, command, insecure).await,
+        #[cfg(feature = "ssh-russh")]
+        Command::SftpChainLs {
+            jumps,
+            target,
+            key,
+            path,
+            insecure,
+        } => cmd_sftp_chain_ls(jumps, target, key, path, insecure).await,
         Command::Highlight { text } => cmd_highlight(text),
         Command::DangerCheck { command } => cmd_danger_check(command),
     }
@@ -805,6 +868,123 @@ async fn cmd_sftp_jump_ls(a: SftpJumpArgs) -> anyhow::Result<()> {
         .context("sftp via jump connect")?;
     let entries = sftp.list_dir(&a.path).await.context("list_dir")?;
     print_listing(&a.path, &entries);
+    Ok(())
+}
+
+/// Parse a `HOST:USER` hop spec (dev harness; port is always 22).
+#[cfg(feature = "ssh-russh")]
+fn parse_hop(spec: &str) -> anyhow::Result<(String, String)> {
+    let (host, user) = spec
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("expected HOST:USER, got `{spec}`"))?;
+    if host.is_empty() || user.is_empty() {
+        return Err(anyhow::anyhow!("empty host or user in `{spec}`"));
+    }
+    Ok((host.to_string(), user.to_string()))
+}
+
+/// A resolved jump chain: ordered gateways (profile + creds), then the target
+/// profile and its creds.
+#[cfg(feature = "ssh-russh")]
+type ResolvedChain = (
+    Vec<(ConnectionProfile, rrs_protocols::ResolvedCredentials)>,
+    ConnectionProfile,
+    rrs_protocols::ResolvedCredentials,
+);
+
+/// Build an ordered gateway chain + target from CLI hop specs. Per-hop passwords
+/// come from `NEXTERM_JUMP<i>_PASSWORD` (1-based) and `NEXTERM_TARGET_PASSWORD`;
+/// `key` (if any) is shared across all hops. Secrets are never printed.
+#[cfg(feature = "ssh-russh")]
+fn build_chain(
+    jumps: &[String],
+    target: &str,
+    key: Option<String>,
+    insecure: bool,
+) -> anyhow::Result<ResolvedChain> {
+    let strict = !insecure;
+    let mut gateways = Vec::with_capacity(jumps.len());
+    for (i, spec) in jumps.iter().enumerate() {
+        let (host, user) = parse_hop(spec)?;
+        let profile = ssh_profile(
+            &format!("jump{}", i + 1),
+            &host,
+            22,
+            &user,
+            key.clone(),
+            strict,
+        );
+        let creds = creds_from_env(&format!("NEXTERM_JUMP{}_PASSWORD", i + 1));
+        gateways.push((profile, creds));
+    }
+    let (thost, tuser) = parse_hop(target)?;
+    let target_profile = ssh_profile("target", &thost, 22, &tuser, key, strict);
+    let target_creds = creds_from_env("NEXTERM_TARGET_PASSWORD");
+    Ok((gateways, target_profile, target_creds))
+}
+
+#[cfg(feature = "ssh-russh")]
+async fn cmd_ssh_chain_connect(
+    jumps: Vec<String>,
+    target: String,
+    key: Option<String>,
+    command: Option<String>,
+    insecure: bool,
+) -> anyhow::Result<()> {
+    use rrs_protocols::{Connector, JumpHop, RusshConnector};
+
+    let (gateways, target_profile, target_creds) = build_chain(&jumps, &target, key, insecure)?;
+    let hops: Vec<JumpHop<'_>> = gateways.iter().map(|(p, c)| JumpHop::new(p, c)).collect();
+
+    println!(
+        "connecting via chain: {} -> {target} ...",
+        jumps.join(" -> ")
+    );
+    let connector = RusshConnector;
+    let mut session = connector
+        .connect_shell_via_jump_chain(&hops, &target_profile, &target_creds)
+        .await
+        .context("chain connect")?;
+    println!("connected to target through {} gateway(s)", gateways.len());
+
+    let cmd = command.unwrap_or_else(|| "echo CHAIN_OK; hostname".to_string());
+    session.write(format!("{cmd}\nexit\n").as_bytes()).await?;
+    loop {
+        let chunk = session.read().await?;
+        if chunk.is_empty() {
+            break;
+        }
+        print!("{}", String::from_utf8_lossy(&chunk));
+    }
+    session.close().await?;
+    println!("\n(ssh-chain-connect complete)");
+    Ok(())
+}
+
+#[cfg(feature = "ssh-russh")]
+async fn cmd_sftp_chain_ls(
+    jumps: Vec<String>,
+    target: String,
+    key: Option<String>,
+    path: String,
+    insecure: bool,
+) -> anyhow::Result<()> {
+    use rrs_protocols::{Connector, JumpHop, RusshConnector};
+
+    let (gateways, target_profile, target_creds) = build_chain(&jumps, &target, key, insecure)?;
+    let hops: Vec<JumpHop<'_>> = gateways.iter().map(|(p, c)| JumpHop::new(p, c)).collect();
+
+    println!(
+        "opening SFTP via chain: {} -> {target} ...",
+        jumps.join(" -> ")
+    );
+    let connector = RusshConnector;
+    let sftp = connector
+        .connect_sftp_via_jump_chain(&hops, &target_profile, &target_creds)
+        .await
+        .context("sftp chain connect")?;
+    let entries = sftp.list_dir(&path).await.context("list_dir")?;
+    print_listing(&path, &entries);
     Ok(())
 }
 

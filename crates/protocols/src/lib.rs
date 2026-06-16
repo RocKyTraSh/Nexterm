@@ -9,7 +9,10 @@ pub mod traits;
 pub mod local;
 
 pub use error::{ProtocolError, Result};
-pub use traits::{Connector, DirEntry, EntryKind, RemoteSession, ResolvedCredentials, SftpClient};
+pub use traits::{
+    Connector, DirEntry, EntryKind, JumpHop, RemoteSession, ResolvedCredentials, SftpClient,
+    MAX_JUMP_CHAIN,
+};
 
 #[cfg(feature = "local-pty")]
 pub use local::{LocalPtySession, LocalShellConnector};

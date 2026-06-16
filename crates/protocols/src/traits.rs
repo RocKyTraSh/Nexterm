@@ -46,13 +46,32 @@ pub trait RemoteSession: Send {
     async fn close(&mut self) -> Result<()>;
 }
 
+/// Maximum number of gateways in a jump chain (`gateway1 → … → gatewayN →
+/// target`). A safety bound against runaway/cyclic configs; honored by both the
+/// orchestration layer and the transport.
+pub const MAX_JUMP_CHAIN: usize = 8;
+
+/// One fully-resolved hop in a jump chain: a profile plus its transient
+/// credentials. Built by the orchestration layer (`AppCore`) and passed to a
+/// [`Connector`] as a borrowed slice, so nothing is cloned or stored.
+pub struct JumpHop<'a> {
+    pub profile: &'a ConnectionProfile,
+    pub creds: &'a ResolvedCredentials,
+}
+
+impl<'a> JumpHop<'a> {
+    pub fn new(profile: &'a ConnectionProfile, creds: &'a ResolvedCredentials) -> Self {
+        Self { profile, creds }
+    }
+}
+
 /// Opens connections for a particular protocol.
 ///
 /// The jump-host and SFTP methods have default implementations that report
 /// `NotImplemented`, so a connector only overrides what it actually supports.
-/// Orchestration (resolving the second hop's profile + secret) lives in the
-/// caller — a `Connector` is handed fully-resolved profiles and credentials and
-/// never touches the profile/credential stores itself.
+/// Orchestration (resolving each hop's profile + secret) lives in the caller —
+/// a `Connector` is handed fully-resolved profiles and credentials and never
+/// touches the profile/credential stores itself.
 #[async_trait]
 pub trait Connector: Send + Sync {
     /// Open an interactive shell using `profile` and transient `creds`.
@@ -101,6 +120,36 @@ pub trait Connector: Send + Sync {
         let _ = (jump, jump_creds, target, target_creds);
         Err(ProtocolError::NotImplemented(
             "SFTP over a jump host is not supported by this connector",
+        ))
+    }
+
+    /// Open an interactive shell on `target` through an ordered chain of
+    /// gateways (`gateways[0] → gateways[1] → … → target`). `gateways` may have
+    /// any length from 1 to [`MAX_JUMP_CHAIN`]; each hop is verified and
+    /// authenticated independently. The shell runs on the **target**.
+    async fn connect_shell_via_jump_chain(
+        &self,
+        gateways: &[JumpHop<'_>],
+        target: &ConnectionProfile,
+        target_creds: &ResolvedCredentials,
+    ) -> Result<Box<dyn RemoteSession>> {
+        let _ = (gateways, target, target_creds);
+        Err(ProtocolError::NotImplemented(
+            "jump-chain shell is not supported by this connector",
+        ))
+    }
+
+    /// Open an SFTP client on `target` through an ordered chain of gateways.
+    /// See [`connect_shell_via_jump_chain`](Self::connect_shell_via_jump_chain).
+    async fn connect_sftp_via_jump_chain(
+        &self,
+        gateways: &[JumpHop<'_>],
+        target: &ConnectionProfile,
+        target_creds: &ResolvedCredentials,
+    ) -> Result<Box<dyn SftpClient>> {
+        let _ = (gateways, target, target_creds);
+        Err(ProtocolError::NotImplemented(
+            "SFTP over a jump chain is not supported by this connector",
         ))
     }
 }

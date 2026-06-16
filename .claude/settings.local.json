@@ -35,7 +35,10 @@
       "Bash(cargo tree *)",
       "Bash(./target/debug/rrs --help)",
       "Bash(./target/debug/rrs sftp-jump-ls *)",
-      "Bash(./target/debug/rrs sftp-ls *)"
+      "Bash(./target/debug/rrs sftp-ls *)",
+      "Bash(echo \"default tree russh count \\(0=good\\): $\\(cargo tree --no-default-features)",
+      "Bash(./target/debug/rrs ssh-chain-connect *)",
+      "Bash(NEXTERM_TARGET_PASSWORD=x ./target/debug/rrs ssh-chain-connect --jump gw1 --target t:u)"
     ]
   }
 }
