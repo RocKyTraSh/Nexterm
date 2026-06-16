@@ -11,6 +11,9 @@ pub enum ProtocolError {
     #[error("channel error: {0}")]
     Channel(String),
 
+    #[error("agent forwarding error: {0}")]
+    Agent(String),
+
     #[error("sftp error: {0}")]
     Sftp(String),
 

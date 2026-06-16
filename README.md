@@ -144,6 +144,13 @@ cargo run -p rrs-cli --features ssh-russh -- ssh-connect \
 cargo run -p rrs-cli --features ssh-russh -- ssh-connect \
   --host 192.168.1.10 --user root --key ~/.ssh/id_ed25519
 
+# SSH agent forwarding (выключено по умолчанию; нужен запущенный агент):
+#   eval "$(ssh-agent)"; ssh-add ~/.ssh/id_ed25519
+cargo run -p rrs-cli --features ssh-russh -- ssh-connect \
+  --host 192.168.1.10 --user root --key ~/.ssh/id_ed25519 \
+  --agent-forwarding --command 'echo "$SSH_AUTH_SOCK"; ssh-add -l'
+# Если ssh-add -l на target показывает ключи локального агента — forwarding работает.
+
 # Jump-host: shell на target ЧЕРЕЗ gateway (direct-tcpip; нужна фича ssh-russh).
 # Пароли — из отдельных env-переменных (dev-only, не печатаются); ключи — на хоп.
 NEXTERM_JUMP_PASSWORD='gw-pw' NEXTERM_TARGET_PASSWORD='t-pw' \
@@ -205,6 +212,10 @@ cargo run -p rrs-cli --features ssh-russh -- ssh-chain-connect \
 # Тот же chain по общему ключу на все хопы:
 cargo run -p rrs-cli --features ssh-russh -- ssh-chain-connect \
   --jump gw1:me --jump gw2:me --target t:root --key ~/.ssh/id_ed25519
+# Agent forwarding работает и через chain — пробрасывается только на target shell:
+cargo run -p rrs-cli --features ssh-russh -- ssh-chain-connect \
+  --jump gw1:me --jump gw2:me --target t:root --key ~/.ssh/id_ed25519 \
+  --agent-forwarding --command 'ssh-add -l'
 
 # SFTP через цепочку jump-host:
 NEXTERM_JUMP1_PASSWORD='pw1' NEXTERM_JUMP2_PASSWORD='pw2' NEXTERM_TARGET_PASSWORD='pwt' \
@@ -232,14 +243,31 @@ cargo test --workspace
   (крипто-бэкенд `ring`). Готово: PTY-shell как `RemoteSession`, SFTP
   (`RusshSftp`), аутентификация agent→key→password→keyboard-interactive,
   проверка `known_hosts` с учётом `strict_host_key_checking`, **multi-hop
-  jump-host chains (`direct-tcpip`)** и **реальный tunnel driver (все три вида:
-  local `-L` + dynamic SOCKS5 `-D` + remote `-R`)**. Внутри — единый
-  переиспользуемый примитив `SshConnection` (connect / connect через цепочку
-  jump / `open_shell` / `open_sftp` / `open_forward_stream` /
+  jump-host chains (`direct-tcpip`)**, **реальный tunnel driver (все три вида:
+  local `-L` + dynamic SOCKS5 `-D` + remote `-R`)** и **SSH agent forwarding**.
+  Внутри — единый переиспользуемый примитив `SshConnection` (connect / connect
+  через цепочку jump / `open_shell` / `open_sftp` / `open_forward_stream` /
   `request_remote_forward`), без копипасты auth/known_hosts.
   - Auth methods реально готовы: **agent, public key, password,
     keyboard-interactive**. Strict mode: неизвестный host-key → отказ;
     non-strict → подключение + warning; изменённый ключ → всегда отказ.
+  - **Agent forwarding** (флаг `--agent-forwarding` у `ssh-connect`,
+    `ssh-jump-connect`, `ssh-chain-connect`; поле `SshSettings.agent_forwarding`,
+    **по умолчанию выключено**). Когда включено и `$SSH_AUTH_SOCK` задан: на
+    session-канале запрашивается `auth-agent-req@openssh.com`; входящие
+    `auth-agent@openssh.com` каналы handler **прозрачно проксирует** на локальный
+    агент-сокет (`copy_bidirectional` к `UnixStream`). Agent-протокол **не
+    парсится и не логируется**; приватный ключ не передаётся (агент только
+    подписывает). Если включено, но `$SSH_AUTH_SOCK` не задан — **fail-closed**:
+    понятная ошибка (`agent forwarding requested but no local SSH agent`), а не
+    тихое продолжение. Работает для **shell** (direct и через jump-chain —
+    forwarding только на target shell, не на gateways). **SFTP и tunnels не
+    требуют** agent forwarding и его не запрашивают.
+    Ручная проверка: `--command 'echo "$SSH_AUTH_SOCK"; ssh-add -l'` — если на
+    target виден сокет и ключи локального агента, forwarding работает. **Риск
+    безопасности**: пока соединение активно, доверенный сервер может попросить
+    forwarded-агент подписать произвольные запросы — включайте только для
+    доверенных серверов.
   - **Jump-host chains** для **shell** (`ssh-jump-connect`, `ssh-chain-connect`)
     и **SFTP** (`sftp-jump-ls`, `sftp-chain-ls`): на каждом хопе открывается
     `direct-tcpip` канал к следующему хопу, поверх него поднимается отдельная
@@ -297,9 +325,11 @@ cargo test --workspace
     `NEXTERM_CHAIN_JUMP2_*`, `NEXTERM_CHAIN_TARGET_*` + `NEXTERM_CHAIN_TARGET_SFTP_PATH`),
     `local_tunnel_roundtrip`, `dynamic_socks_roundtrip` и `remote_tunnel_roundtrip`
     (`rrs-tunnels`, env `NEXTERM_SSH_TEST_*`; для `-R` ещё `NEXTERM_REMOTE_TEST_BIND`;
-    для curl-проверки SOCKS — `NEXTERM_SOCKS_TEST_URL`), плюс `sftp_roundtrip`
-    (direct).
-  - Ещё не сделано: проброс SSH-агента; remote (`-R`) через jump-chain.
+    для curl-проверки SOCKS — `NEXTERM_SOCKS_TEST_URL`), `agent_forwarding_roundtrip`
+    (`rrs-protocols`, env `NEXTERM_SSH_TEST_*` + запущенный `SSH_AUTH_SOCK`), плюс
+    `sftp_roundtrip` (direct).
+  - Ещё не сделано: remote (`-R`) через jump-chain; несколько `-R` на одно
+    соединение; отдельный `CredentialRef` для key-passphrase.
 - `pty` — локальный shell через PTY (`portable-pty`), в крейте `rrs-terminal`.
 - `local-pty` (на `rrs-cli`/`rrs-protocols`) — local-shell как полноценный транспорт
   через `AppCore::connect` (`LocalShellConnector`/`LocalPtySession`); тянет `pty`.
@@ -341,15 +371,14 @@ RUST_LOG=rrs_miniservers=debug,info cargo run -p rrs-cli -- serve-http
 - **v0.2:** реальный SSH+SFTP через `russh` ✓; реальный PTY ✓; multi-hop
   jump-host chains для shell и SFTP ✓; оркестрация jump-host chains в `AppCore`
   ✓; tunnel driver — local (`-L`) ✓, dynamic SOCKS5 (`-D`) ✓ и remote (`-R`) ✓;
-  SQLite-хранилище с миграциями; Qt/QML-скелет (одно окно + вкладка поверх
-  `AppCore`).
+  agent forwarding ✓; SQLite-хранилище с миграциями; Qt/QML-скелет (одно окно +
+  вкладка поверх `AppCore`).
 - **v0.3:** полноценная SGR-aware подсветка; вендорные пресеты (Cisco/MikroTik/
-  …); проброс SSH-агента; tunnel-менеджмент в GUI; больше мини-серверов
-  (TFTP/FTP/SSH); GTK-фронтенд.
+  …); tunnel-менеджмент в GUI; больше мини-серверов (TFTP/FTP/SSH); GTK-фронтенд.
 - **Долгосрочно:** RDP (IronRDP) и VNC; обёртки X-сервера (Xephyr/Xvfb/Xwayland,
   без переписывания Xorg); серверы NFS/Telnet/VNC; интеграция с systemd
   (user-services); поддержка Windows (backend Windows Credential Manager за тем
-  же трейтом `CredentialStore`); проброс агента SSH.
+  же трейтом `CredentialStore`).
 
 ## Лицензия
 MIT OR Apache-2.0.

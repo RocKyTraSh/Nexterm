@@ -180,3 +180,42 @@ impl ConnectionProfile {
         self.settings.kind()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_forwarding_defaults_off() {
+        // Safe default: agent forwarding is opt-in.
+        assert!(!SshSettings::default().agent_forwarding);
+        let profile = ConnectionProfile::new_ssh("h", "host", "user");
+        if let ProtocolSettings::Ssh(s) = &profile.settings {
+            assert!(!s.agent_forwarding);
+        } else {
+            panic!("expected SSH settings");
+        }
+    }
+
+    #[test]
+    fn old_profile_without_agent_forwarding_deserializes_to_false() {
+        // An SshSettings JSON predating the field must still load (serde default).
+        let json = r#"{"host":"h","port":22,"username":"u"}"#;
+        let s: SshSettings = serde_json::from_str(json).expect("deserialize legacy settings");
+        assert!(!s.agent_forwarding);
+        assert!(s.strict_host_key_checking, "strict default preserved");
+    }
+
+    #[test]
+    fn agent_forwarding_roundtrips_when_enabled() {
+        let mut s = SshSettings {
+            host: "h".into(),
+            username: "u".into(),
+            ..SshSettings::default()
+        };
+        s.agent_forwarding = true;
+        let json = serde_json::to_string(&s).unwrap();
+        let back: SshSettings = serde_json::from_str(&json).unwrap();
+        assert!(back.agent_forwarding);
+    }
+}

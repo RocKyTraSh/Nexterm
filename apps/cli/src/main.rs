@@ -84,6 +84,9 @@ enum Command {
         /// Disable known_hosts checking (accept unknown host keys).
         #[arg(long)]
         insecure: bool,
+        /// Forward the local SSH agent ($SSH_AUTH_SOCK) to the remote shell.
+        #[arg(long)]
+        agent_forwarding: bool,
     },
     /// Connect to a target host *through* a jump host and run one command
     /// (needs `--features ssh-russh`).
@@ -124,6 +127,9 @@ enum Command {
         /// Disable known_hosts checking for both hops (accept unknown keys).
         #[arg(long)]
         insecure: bool,
+        /// Forward the local SSH agent to the target shell (not the gateway).
+        #[arg(long)]
+        agent_forwarding: bool,
     },
     /// Run an SSH local port-forward (`ssh -L`) until Ctrl-C
     /// (needs `--features ssh-russh`).
@@ -302,6 +308,9 @@ enum Command {
         /// Disable known_hosts checking for all hops (accept unknown keys).
         #[arg(long)]
         insecure: bool,
+        /// Forward the local SSH agent to the target shell (not the gateways).
+        #[arg(long)]
+        agent_forwarding: bool,
     },
     /// List a remote directory over SFTP through a CHAIN of jump hosts
     /// (needs `--features ssh-russh`). Same `--jump`/`--target` UX as
@@ -367,7 +376,20 @@ async fn main() -> anyhow::Result<()> {
             key,
             password_env,
             insecure,
-        } => cmd_ssh_connect(host, port, user, command, key, password_env, insecure).await,
+            agent_forwarding,
+        } => {
+            cmd_ssh_connect(
+                host,
+                port,
+                user,
+                command,
+                key,
+                password_env,
+                insecure,
+                agent_forwarding,
+            )
+            .await
+        }
         #[cfg(feature = "ssh-russh")]
         Command::SshJumpConnect {
             jump_host,
@@ -382,6 +404,7 @@ async fn main() -> anyhow::Result<()> {
             target_password_env,
             command,
             insecure,
+            agent_forwarding,
         } => {
             cmd_ssh_jump_connect(JumpArgs {
                 jump_host,
@@ -396,6 +419,7 @@ async fn main() -> anyhow::Result<()> {
                 target_password_env,
                 command,
                 insecure,
+                agent_forwarding,
             })
             .await
         }
@@ -514,7 +538,8 @@ async fn main() -> anyhow::Result<()> {
             key,
             command,
             insecure,
-        } => cmd_ssh_chain_connect(jumps, target, key, command, insecure).await,
+            agent_forwarding,
+        } => cmd_ssh_chain_connect(jumps, target, key, command, insecure, agent_forwarding).await,
         #[cfg(feature = "ssh-russh")]
         Command::SftpChainLs {
             jumps,
@@ -654,6 +679,7 @@ async fn cmd_ssh_connect(
     key: Option<String>,
     password_env: String,
     insecure: bool,
+    agent_forwarding: bool,
 ) -> anyhow::Result<()> {
     use rrs_core::model::{CredentialRef, ProtocolSettings};
     use rrs_credentials::Secret;
@@ -668,6 +694,7 @@ async fn cmd_ssh_connect(
         s.port = port;
         s.private_key_path = key;
         s.strict_host_key_checking = !insecure;
+        s.agent_forwarding = agent_forwarding;
     }
 
     // Dev-only: pull the password from the environment and stash it in the
@@ -712,9 +739,11 @@ struct JumpArgs {
     target_password_env: String,
     command: Option<String>,
     insecure: bool,
+    agent_forwarding: bool,
 }
 
-/// Build an SSH profile for one hop from CLI flags.
+/// Build an SSH profile for one hop from CLI flags. `agent_forwarding` should be
+/// set only on the hop whose shell is opened (the final target).
 #[cfg(feature = "ssh-russh")]
 fn ssh_profile(
     name: &str,
@@ -723,6 +752,7 @@ fn ssh_profile(
     user: &str,
     key: Option<String>,
     strict: bool,
+    agent_forwarding: bool,
 ) -> ConnectionProfile {
     use rrs_core::model::ProtocolSettings;
     let mut profile = ConnectionProfile::new_ssh(name, host, user);
@@ -730,6 +760,7 @@ fn ssh_profile(
         s.port = port;
         s.private_key_path = key;
         s.strict_host_key_checking = strict;
+        s.agent_forwarding = agent_forwarding;
     }
     profile
 }
@@ -770,6 +801,7 @@ async fn cmd_ssh_jump_connect(a: JumpArgs) -> anyhow::Result<()> {
     use rrs_protocols::{Connector, RusshConnector};
 
     let strict = !a.insecure;
+    // Agent forwarding applies only to the target shell, not the gateway.
     let jump = ssh_profile(
         "jump",
         &a.jump_host,
@@ -777,6 +809,7 @@ async fn cmd_ssh_jump_connect(a: JumpArgs) -> anyhow::Result<()> {
         &a.jump_user,
         a.jump_key,
         strict,
+        false,
     );
     let target = ssh_profile(
         "target",
@@ -785,6 +818,7 @@ async fn cmd_ssh_jump_connect(a: JumpArgs) -> anyhow::Result<()> {
         &a.target_user,
         a.target_key,
         strict,
+        a.agent_forwarding,
     );
     let jump_creds = creds_from_env(&a.jump_password_env);
     let target_creds = creds_from_env(&a.target_password_env);
@@ -1032,7 +1066,7 @@ async fn cmd_sftp_ls(
 ) -> anyhow::Result<()> {
     use rrs_protocols::{RusshSftp, SftpClient};
 
-    let profile = ssh_profile("sftp", &host, port, &user, key, !insecure);
+    let profile = ssh_profile("sftp", &host, port, &user, key, !insecure, false);
     let creds = creds_from_env(&password_env);
 
     println!("opening SFTP to {host}:{port} ...");
@@ -1066,6 +1100,7 @@ async fn cmd_sftp_jump_ls(a: SftpJumpArgs) -> anyhow::Result<()> {
     use rrs_protocols::{RusshSftp, SftpClient};
 
     let strict = !a.insecure;
+    // SFTP does not need agent forwarding.
     let jump = ssh_profile(
         "jump",
         &a.jump_host,
@@ -1073,6 +1108,7 @@ async fn cmd_sftp_jump_ls(a: SftpJumpArgs) -> anyhow::Result<()> {
         &a.jump_user,
         a.jump_key,
         strict,
+        false,
     );
     let target = ssh_profile(
         "target",
@@ -1081,6 +1117,7 @@ async fn cmd_sftp_jump_ls(a: SftpJumpArgs) -> anyhow::Result<()> {
         &a.target_user,
         a.target_key,
         strict,
+        false,
     );
     let jump_creds = creds_from_env(&a.jump_password_env);
     let target_creds = creds_from_env(&a.target_password_env);
@@ -1127,11 +1164,13 @@ fn build_chain(
     target: &str,
     key: Option<String>,
     insecure: bool,
+    agent_forwarding: bool,
 ) -> anyhow::Result<ResolvedChain> {
     let strict = !insecure;
     let mut gateways = Vec::with_capacity(jumps.len());
     for (i, spec) in jumps.iter().enumerate() {
         let (host, user) = parse_hop(spec)?;
+        // Gateways never open a shell, so they never forward the agent.
         let profile = ssh_profile(
             &format!("jump{}", i + 1),
             &host,
@@ -1139,12 +1178,13 @@ fn build_chain(
             &user,
             key.clone(),
             strict,
+            false,
         );
         let creds = creds_from_env(&format!("NEXTERM_JUMP{}_PASSWORD", i + 1));
         gateways.push((profile, creds));
     }
     let (thost, tuser) = parse_hop(target)?;
-    let target_profile = ssh_profile("target", &thost, 22, &tuser, key, strict);
+    let target_profile = ssh_profile("target", &thost, 22, &tuser, key, strict, agent_forwarding);
     let target_creds = creds_from_env("NEXTERM_TARGET_PASSWORD");
     Ok((gateways, target_profile, target_creds))
 }
@@ -1156,10 +1196,12 @@ async fn cmd_ssh_chain_connect(
     key: Option<String>,
     command: Option<String>,
     insecure: bool,
+    agent_forwarding: bool,
 ) -> anyhow::Result<()> {
     use rrs_protocols::{Connector, JumpHop, RusshConnector};
 
-    let (gateways, target_profile, target_creds) = build_chain(&jumps, &target, key, insecure)?;
+    let (gateways, target_profile, target_creds) =
+        build_chain(&jumps, &target, key, insecure, agent_forwarding)?;
     let hops: Vec<JumpHop<'_>> = gateways.iter().map(|(p, c)| JumpHop::new(p, c)).collect();
 
     println!(
@@ -1197,7 +1239,9 @@ async fn cmd_sftp_chain_ls(
 ) -> anyhow::Result<()> {
     use rrs_protocols::{Connector, JumpHop, RusshConnector};
 
-    let (gateways, target_profile, target_creds) = build_chain(&jumps, &target, key, insecure)?;
+    // SFTP does not need agent forwarding.
+    let (gateways, target_profile, target_creds) =
+        build_chain(&jumps, &target, key, insecure, false)?;
     let hops: Vec<JumpHop<'_>> = gateways.iter().map(|(p, c)| JumpHop::new(p, c)).collect();
 
     println!(

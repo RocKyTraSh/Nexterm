@@ -45,7 +45,9 @@
       "Bash(sed -i 's/pub use russh_impl::{DirectTcpipStream, RusshConnector, RusshSession, RusshSftp, SshConnection};/pub use russh_impl::{\\\\n    DirectTcpipStream, ForwardedConnection, RusshConnector, RusshSession, RusshSftp, SshConnection,\\\\n};/' crates/protocols/src/ssh/mod.rs)",
       "Bash(sed -i 's/pub use ssh::{DirectTcpipStream, RusshConnector, RusshSftp, SshConnection};/pub use ssh::{\\\\n    DirectTcpipStream, ForwardedConnection, RusshConnector, RusshSftp, SshConnection,\\\\n};/' crates/protocols/src/lib.rs)",
       "Bash(./target/debug/rrs tunnel-remote *)",
-      "Bash(NEXTERM_SSH_PASSWORD=x ./target/debug/rrs tunnel-remote --ssh-host h --ssh-user u --remote-bind nope --local-target 127.0.0.1:8080)"
+      "Bash(NEXTERM_SSH_PASSWORD=x ./target/debug/rrs tunnel-remote --ssh-host h --ssh-user u --remote-bind nope --local-target 127.0.0.1:8080)",
+      "Bash(git rev-list *)",
+      "Bash(git fetch *)"
     ]
   }
 }

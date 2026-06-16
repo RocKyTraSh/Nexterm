@@ -19,7 +19,11 @@
 //!   ([`Connector::connect_shell_via_jump`], [`RusshSftp::connect_via_jump`])
 //!   delegate to the chain path. Up to [`MAX_JUMP_CHAIN`] gateways;
 //! * a reusable `direct-tcpip` forwarding stream ([`SshConnection::open_forward_stream`])
-//!   that backs the `rrs-tunnels` russh driver.
+//!   that backs the `rrs-tunnels` russh driver;
+//! * **SSH agent forwarding** for shells when `SshSettings::agent_forwarding` is
+//!   set: we request it on the session channel and blindly proxy any
+//!   `auth-agent@openssh.com` channel the server opens to the local agent
+//!   (`$SSH_AUTH_SOCK`). The agent protocol bytes are never parsed or logged.
 //!
 //! The connection lifecycle (TCP/stream connect → host-key check → auth) lives
 //! in one reusable primitive, [`SshConnection`], so shells, SFTP, jump-host
@@ -27,12 +31,11 @@
 //! known_hosts logic). Each hop in a chain is verified and authenticated
 //! independently.
 //!
-//! Not yet implemented (clear errors / TODOs, no fake behavior):
-//! * agent forwarding into the channel.
-//!
 //! Secrets: passwords / passphrases come from [`ResolvedCredentials`] only, are
-//! never read from the profile, and are never logged.
+//! never read from the profile, and are never logged. The forwarded agent's
+//! protocol payload is forwarded byte-for-byte and never inspected.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -122,6 +125,27 @@ pub fn plan_auth(methods: &[AuthMethod], has_password: bool, has_key: bool) -> V
     plan
 }
 
+/// Decide whether to request agent forwarding on a shell, and validate that the
+/// prerequisites are met. Pure (unit-tested).
+///
+/// * `enabled == false` → `Ok(false)` (don't request; behavior unchanged).
+/// * `enabled == true` and an agent socket is present → `Ok(true)` (request it).
+/// * `enabled == true` but no agent socket → `Err` (fail closed: the user asked
+///   for forwarding, so silently dropping it would be surprising and insecure).
+pub fn plan_agent_forwarding(enabled: bool, has_agent_sock: bool) -> Result<bool> {
+    if !enabled {
+        return Ok(false);
+    }
+    if !has_agent_sock {
+        return Err(ProtocolError::Agent(
+            "agent forwarding requested but no local SSH agent is available \
+             (SSH_AUTH_SOCK is unset)"
+                .into(),
+        ));
+    }
+    Ok(true)
+}
+
 // ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
@@ -142,8 +166,10 @@ pub struct ForwardedConnection {
     pub stream: DirectTcpipStream,
 }
 
-/// russh client handler: verifies the host key and (for `ssh -R`) routes
-/// incoming `forwarded-tcpip` channels to the tunnel driver.
+/// russh client handler: verifies the host key, routes incoming
+/// `forwarded-tcpip` channels (`ssh -R`) to the tunnel driver, and services
+/// `auth-agent@openssh.com` channels (agent forwarding) by proxying them to the
+/// local agent.
 struct ClientHandler {
     host: String,
     port: u16,
@@ -153,24 +179,51 @@ struct ClientHandler {
     /// Sink for incoming `forwarded-tcpip` channels (remote forwarding). The
     /// receiver lives in the owning [`SshConnection`].
     forwarded_tx: mpsc::UnboundedSender<ForwardedConnection>,
+    /// Local agent socket (`$SSH_AUTH_SOCK`) to proxy forwarded agent channels
+    /// to. `None` disables servicing — any (unsolicited) agent channel is
+    /// dropped. Only set when this connection requested agent forwarding.
+    agent_sock: Option<PathBuf>,
 }
 
 impl ClientHandler {
     /// Build a handler from SSH settings, wired to `forwarded_tx` for incoming
-    /// remote-forward channels.
-    fn new(ssh: &SshSettings, forwarded_tx: mpsc::UnboundedSender<ForwardedConnection>) -> Self {
+    /// remote-forward channels and (optionally) `agent_sock` for agent
+    /// forwarding.
+    fn new(
+        ssh: &SshSettings,
+        forwarded_tx: mpsc::UnboundedSender<ForwardedConnection>,
+        agent_sock: Option<PathBuf>,
+    ) -> Self {
         Self {
             host: ssh.host.clone(),
             port: ssh.port,
             strict: ssh.strict_host_key_checking,
             hostkey_status: Arc::new(AtomicU8::new(HK_PENDING)),
             forwarded_tx,
+            agent_sock,
         }
     }
 }
 
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
+
+    /// Called by russh when the server opens an `auth-agent@openssh.com` channel
+    /// (the remote wants to talk to our forwarded agent). We blindly proxy the
+    /// channel to the local agent socket; the agent protocol is never parsed or
+    /// logged. The channel is only serviced if this connection opted into agent
+    /// forwarding (`agent_sock` is set), otherwise it is dropped (closed).
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        channel: Channel<client::Msg>,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        if let Some(sock) = &self.agent_sock {
+            tokio::spawn(proxy_agent_channel(channel, sock.clone()));
+        }
+        // else: unsolicited agent channel — drop it (closes on drop).
+        Ok(())
+    }
 
     /// Called by russh when the server opens a `forwarded-tcpip` channel (a
     /// connection arrived on a remote bind we requested via `tcpip-forward`).
@@ -237,6 +290,31 @@ impl client::Handler for ClientHandler {
     }
 }
 
+/// Blindly proxy a forwarded `auth-agent@openssh.com` channel to the local SSH
+/// agent socket. The agent protocol is **not** parsed or logged — bytes are
+/// copied verbatim in both directions until either side closes.
+///
+/// Unix-only (the OpenSSH agent speaks over a Unix domain socket). On error
+/// connecting to the agent the channel is dropped (closed); we log only the
+/// connection error, never any agent traffic.
+#[cfg(unix)]
+async fn proxy_agent_channel(channel: Channel<client::Msg>, sock: PathBuf) {
+    let mut stream = channel.into_stream();
+    match tokio::net::UnixStream::connect(&sock).await {
+        Ok(mut agent) => {
+            let _ = tokio::io::copy_bidirectional(&mut stream, &mut agent).await;
+        }
+        Err(e) => {
+            tracing::warn!("agent forwarding: cannot connect to local SSH agent: {e}");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn proxy_agent_channel(_channel: Channel<client::Msg>, _sock: PathBuf) {
+    tracing::warn!("agent forwarding is only supported on Unix");
+}
+
 // ---------------------------------------------------------------------------
 // Connector
 // ---------------------------------------------------------------------------
@@ -263,6 +341,21 @@ pub struct SshConnection {
     /// Receiver of incoming `forwarded-tcpip` channels (remote forwarding).
     /// Taken once by the tunnel driver when it starts a remote forward.
     forwarded_rx: AsyncMutex<Option<mpsc::UnboundedReceiver<ForwardedConnection>>>,
+    /// Whether this connection should request agent forwarding on shells.
+    agent_forwarding: bool,
+    /// Resolved local agent socket (`$SSH_AUTH_SOCK`), present only when
+    /// `agent_forwarding` is set and the env var exists.
+    agent_sock: Option<PathBuf>,
+}
+
+/// The local agent socket to forward to, if `ssh` opted into agent forwarding
+/// and `$SSH_AUTH_SOCK` is set. `None` means "do not forward the agent".
+fn agent_sock_for(ssh: &SshSettings) -> Option<PathBuf> {
+    if ssh.agent_forwarding {
+        std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from)
+    } else {
+        None
+    }
 }
 
 impl SshConnection {
@@ -270,10 +363,11 @@ impl SshConnection {
     pub async fn connect(ssh: &SshSettings, creds: &ResolvedCredentials) -> Result<Self> {
         let config = Arc::new(client::Config::default());
         let (tx, rx) = mpsc::unbounded_channel();
+        let agent_sock = agent_sock_for(ssh);
         let mut handle = client::connect(
             config,
             (ssh.host.clone(), ssh.port),
-            ClientHandler::new(ssh, tx),
+            ClientHandler::new(ssh, tx, agent_sock.clone()),
         )
         .await
         .map_err(|e| ProtocolError::Connect(e.to_string()))?;
@@ -282,6 +376,8 @@ impl SshConnection {
             handle,
             _via: None,
             forwarded_rx: AsyncMutex::new(Some(rx)),
+            agent_forwarding: ssh.agent_forwarding,
+            agent_sock,
         })
     }
 
@@ -299,14 +395,21 @@ impl SshConnection {
     {
         let config = Arc::new(client::Config::default());
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut handle = client::connect_stream(config, stream, ClientHandler::new(ssh, tx))
-            .await
-            .map_err(|e| ProtocolError::Connect(e.to_string()))?;
+        let agent_sock = agent_sock_for(ssh);
+        let mut handle = client::connect_stream(
+            config,
+            stream,
+            ClientHandler::new(ssh, tx, agent_sock.clone()),
+        )
+        .await
+        .map_err(|e| ProtocolError::Connect(e.to_string()))?;
         authenticate(&mut handle, ssh, creds).await?;
         Ok(Self {
             handle,
             _via: Some(Box::new(via)),
             forwarded_rx: AsyncMutex::new(Some(rx)),
+            agent_forwarding: ssh.agent_forwarding,
+            agent_sock,
         })
     }
 
@@ -390,6 +493,15 @@ impl SshConnection {
     /// [`RusshSession`] keeps it — and any gateway — alive).
     pub async fn open_shell(self) -> Result<RusshSession> {
         let channel = self.open_session_channel().await?;
+        // Request agent forwarding before the shell, if opted in. Incoming
+        // `auth-agent@openssh.com` channels are serviced by the connection's
+        // handler (proxied to the local agent).
+        if plan_agent_forwarding(self.agent_forwarding, self.agent_sock.is_some())? {
+            channel
+                .agent_forward(true)
+                .await
+                .map_err(|e| ProtocolError::Agent(e.to_string()))?;
+        }
         channel
             .request_pty(false, DEFAULT_TERM, DEFAULT_COLS, DEFAULT_ROWS, 0, 0, &[])
             .await
@@ -1093,6 +1205,19 @@ mod tests {
     }
 
     #[test]
+    fn agent_forwarding_plan() {
+        // Disabled → never request, regardless of agent availability.
+        assert!(!plan_agent_forwarding(false, false).unwrap());
+        assert!(!plan_agent_forwarding(false, true).unwrap());
+        // Enabled with an agent → request it.
+        assert!(plan_agent_forwarding(true, true).unwrap());
+        // Enabled without an agent → fail closed with a clear error.
+        let err = plan_agent_forwarding(true, false).unwrap_err();
+        assert!(matches!(err, ProtocolError::Agent(_)));
+        assert!(err.to_string().contains("SSH_AUTH_SOCK"));
+    }
+
+    #[test]
     fn jump_chain_validation() {
         let jump = SshSettings {
             host: "gw.example".into(),
@@ -1386,5 +1511,67 @@ mod tests {
                 .expect("open sftp");
         let listing = sftp.list_dir(&path).await.expect("list_dir over chain");
         println!("listed {} entries in {path} via 2-hop chain", listing.len());
+    }
+
+    /// Live agent-forwarding round-trip. Ignored by default (needs a reachable
+    /// sshd, a running local agent with at least one key, and the server to
+    /// permit `AllowAgentForwarding`). Connects with agent forwarding on and
+    /// runs `ssh-add -l` on the target — it should list the local agent's keys
+    /// (proving the forwarded agent works). Run e.g.:
+    ///
+    /// ```text
+    /// eval "$(ssh-agent)"; ssh-add ~/.ssh/id_ed25519
+    /// NEXTERM_SSH_TEST_HOST=127.0.0.1 NEXTERM_SSH_TEST_USER=$USER \
+    /// NEXTERM_SSH_TEST_KEY=$HOME/.ssh/id_ed25519 \
+    /// cargo test -p rrs-protocols --features ssh-russh -- --ignored agent_forwarding_roundtrip
+    /// ```
+    ///
+    /// Skips (passes) with a message if `SSH_AUTH_SOCK` is unset.
+    #[tokio::test]
+    #[ignore = "requires a reachable sshd and a running SSH agent; see doc comment"]
+    async fn agent_forwarding_roundtrip() {
+        if std::env::var_os("SSH_AUTH_SOCK").is_none() {
+            eprintln!("SSH_AUTH_SOCK is unset — skipping agent forwarding round-trip");
+            return;
+        }
+        let host = std::env::var("NEXTERM_SSH_TEST_HOST").expect("NEXTERM_SSH_TEST_HOST");
+        let user = std::env::var("NEXTERM_SSH_TEST_USER").expect("NEXTERM_SSH_TEST_USER");
+        let key = std::env::var("NEXTERM_SSH_TEST_KEY").expect("NEXTERM_SSH_TEST_KEY");
+
+        let ssh = SshSettings {
+            host,
+            username: user,
+            private_key_path: Some(key),
+            strict_host_key_checking: false,
+            agent_forwarding: true,
+            ..SshSettings::default()
+        };
+        let mut session = SshConnection::connect(&ssh, &ResolvedCredentials::default())
+            .await
+            .expect("connect")
+            .open_shell()
+            .await
+            .expect("open shell with agent forwarding");
+
+        session
+            .write(b"echo SOCK=$SSH_AUTH_SOCK; ssh-add -l; exit\n")
+            .await
+            .expect("write");
+        let mut out = Vec::new();
+        loop {
+            let chunk = session.read().await.expect("read");
+            if chunk.is_empty() {
+                break;
+            }
+            out.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8_lossy(&out);
+        println!("--- target output ---\n{text}\n---------------------");
+        // The remote should see a forwarded agent socket.
+        assert!(
+            text.contains("SOCK=/"),
+            "expected a forwarded SSH_AUTH_SOCK on the target, got: {text}"
+        );
+        session.close().await.expect("close");
     }
 }
